@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<!--
+Copyright 2016 The Chromium Authors. All rights reserved.
+Use of this source code is governed by a BSD-style license that can be
+found in the LICENSE file.
+-->
+
+<link rel="import" href="/tracing/base/statistics.html">
+<link rel="import" href="/tracing/metrics/metric_registry.html">
+<link rel="import" href="/tracing/metrics/system_health/utils.html">
+<link rel="import" href="/tracing/model/helpers/chrome_model_helper.html">
+<link rel="import" href="/tracing/model/timed_event.html">
+<link rel="import" href="/tracing/value/numeric.html">
+<link rel="import" href="/tracing/value/value.html">
+
+<script>
+'use strict';
+
+tr.exportTo('tr.metrics.sh', function() {
+  var timeDurationInMs_smallerIsBetter =
+      tr.v.Unit.byName.timeDurationInMs_smallerIsBetter;
+
+  function findTargetRendererHelper(chromeHelper) {
+    var largestPid = -1;
+    for (var pid in chromeHelper.rendererHelpers) {
+      var rendererHelper = chromeHelper.rendererHelpers[pid];
+      if (rendererHelper.isChromeTracingUI)
+        continue;
+      if (pid > largestPid)
+        largestPid = pid;
+    }
+
+    if (largestPid === -1)
+      return undefined;
+
+    return chromeHelper.rendererHelpers[largestPid];
+  }
+
+  function navigationStartFinder(rendererHelper) {
+    var navigationStartsForFrameId = {};
+    rendererHelper.mainThread.sliceGroup.iterateAllEventsInThisContainer(
+        () => true, function(ev) {
+          if (ev.category !== 'blink.user_timing' ||
+              ev.title !== 'navigationStart')
+            return;
+
+          var frameIdRef = ev.args['frame'];
+          var list = navigationStartsForFrameId[frameIdRef];
+          if (list === undefined) {
+              navigationStartsForFrameId[frameIdRef] = list = [];
+          }
+          list.unshift(ev);
+        },
+        this);
+
+    return function findNavigationStartEventForFrameBeforeTimestamp(frameIdRef,
+        ts) {
+      var list = navigationStartsForFrameId[frameIdRef];
+      if (list === undefined)
+        throw new Error('No navigationStartEvent found for frame id "' +
+            frameIdRef + '"');
+
+      var eventBeforeTimestamp;
+      list.forEach(function(ev) {
+        if (ev.start > ts)
+          return;
+
+        if (eventBeforeTimestamp === undefined)
+          eventBeforeTimestamp = ev;
+      }, this);
+      if (eventBeforeTimestamp === undefined)
+        throw new Error('Failed to find navigationStartEvent.');
+      return eventBeforeTimestamp;
+    }
+  }
+
+  function findUrlOfFrameAt(rendererHelper, frameIdRef, ts) {
+    var url;
+
+    var objects = rendererHelper.process.objects;
+    var frameLoaderInstances = objects.instancesByTypeName_['FrameLoader'];
+    if (frameLoaderInstances === undefined) {
+      throw new Error(
+          'Couldn\'t find any FrameLoader instances to query frame url.');
+    }
+    frameLoaderInstances.forEach(function(instance) {
+      if (!instance.isAliveAt(ts))
+        return;
+      var snapshot = instance.getSnapshotAt(ts);
+      if (frameIdRef !== snapshot.args['frame']['id_ref'])
+        return;
+
+      url = snapshot.args['documentLoaderURL'];
+    }, this);
+
+    return url;
+  }
+
+  function findFirstPaintEvents(rendererHelper, title) {
+    var firstPaintEvents = [];
+
+    rendererHelper.process.iterateAllEvents(
+        function(ev) {
+          if (ev.category !== 'blink.user_timing' ||
+              ev.title !== title)
+            return;
+
+          firstPaintEvents.push(ev);
+        }, this);
+
+    return firstPaintEvents;
+  }
+
+  function prepareTelemetryInternalEventPredicate(rendererHelper) {
+    var ignoreRegions = [];
+
+    var internalRegionStart;
+    rendererHelper.mainThread.asyncSliceGroup.iterateAllEventsInThisContainer(
+        () => true, function(slice) {
+          if (!!slice.title.match(/^telemetry\.internal\.[^.]*\.start$/))
+            internalRegionStart = slice.start;
+          if (!!slice.title.match(/^telemetry\.internal\.[^.]*\.end$/)) {
+            var timedEvent = new tr.model.TimedEvent(internalRegionStart);
+            timedEvent.duration = slice.end - internalRegionStart;
+            ignoreRegions.push(timedEvent);
+          }
+        }, this);
+
+    return function isTelemetryInternalEvent(slice) {
+      for (var i = 0; i < ignoreRegions.length; ++ i) {
+        if (ignoreRegions[i].bounds(slice))
+          return true;
+      }
+      return false;
+    }
+  }
+
+  var URL_BLACKLIST = ['about:blank'];
+  function shouldIgnoreURL(url) {
+    return URL_BLACKLIST.indexOf(url) >= 0;
+  }
+
+  function firstPaintMetric(values, model) {
+    var chromeHelper = model.getOrCreateHelper(
+        tr.model.helpers.ChromeModelHelper);
+    var rendererHelper = findTargetRendererHelper(chromeHelper);
+    var isTelemetryInternalEvent =
+        prepareTelemetryInternalEventPredicate(rendererHelper);
+    var findNavigationStartEventForFrameBeforeTimestamp =
+        navigationStartFinder(rendererHelper);
+
+    var numericBuilder =
+      new tr.v.NumericBuilder(timeDurationInMs_smallerIsBetter, 0)
+      .addLinearBins(1000, 20) // 50ms step to 1s
+      .addLinearBins(3000, 20) // 100ms step to 3s
+      .addExponentialBins(20000, 20);
+    var firstContentfulPaintHistogram = numericBuilder.build();
+    firstContentfulPaintHistogram.customizeSummaryOptions({
+      avg: true,
+      count: true,
+      max: true,
+      min: true,
+      std: true,
+      sum: false,
+      percentile: [0.90, 0.95, 0.99],
+    });
+
+    var firstPaintEvents = findFirstPaintEvents(rendererHelper,
+        'firstContentfulPaint');
+    firstPaintEvents = firstPaintEvents.filter(
+        (ev) => !isTelemetryInternalEvent(ev));
+    firstPaintEvents.forEach(function(ev) {
+      var frameIdRef = ev.args['frame'];
+      var url = findUrlOfFrameAt(rendererHelper, frameIdRef, ev.start);
+      if (shouldIgnoreURL(url))
+        return;
+      var navigationStartEvent =
+        findNavigationStartEventForFrameBeforeTimestamp(frameIdRef, ev.start);
+
+      var timeToFirstContentfulPaint = ev.start - navigationStartEvent.start;
+      firstContentfulPaintHistogram.add(timeToFirstContentfulPaint, {url: url});
+    }, this);
+    values.addValue(new tr.v.NumericValue(
+        model.canonicalUrl, 'firstContentfulPaint',
+        firstContentfulPaintHistogram,
+        { description: 'time to first contentful paint' }));
+  }
+
+  firstPaintMetric.prototype = {
+    __proto__: Function.prototype
+  };
+
+  tr.metrics.MetricRegistry.register(firstPaintMetric);
+
+  return {
+    firstPaintMetric: firstPaintMetric
+  };
+});
+</script>
