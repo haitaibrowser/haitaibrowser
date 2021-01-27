@@ -6,52 +6,44 @@
 #define V8_SNAPSHOT_PARTIAL_SERIALIZER_H_
 
 #include "src/address-map.h"
+#include "src/contexts.h"
 #include "src/snapshot/serializer.h"
 
 namespace v8 {
 namespace internal {
 
-class PartialSerializer : public Serializer {
+class StartupSerializer;
+
+class V8_EXPORT_PRIVATE PartialSerializer : public Serializer {
  public:
-  PartialSerializer(Isolate* isolate, Serializer* startup_snapshot_serializer,
-                    SnapshotByteSink* sink);
+  PartialSerializer(Isolate* isolate, StartupSerializer* startup_serializer,
+                    v8::SerializeEmbedderFieldsCallback callback);
 
   ~PartialSerializer() override;
 
   // Serialize the objects reachable from a single object pointer.
-  void Serialize(Object** o);
+  void Serialize(Context* o, bool include_global_proxy);
+
+  bool can_be_rehashed() const { return can_be_rehashed_; }
 
  private:
-  class PartialCacheIndexMap : public AddressMapBase {
-   public:
-    PartialCacheIndexMap() : map_(HashMap::PointersMatch) {}
+  void SerializeObject(HeapObject o) override;
 
-    static const int kInvalidIndex = -1;
+  bool ShouldBeInThePartialSnapshotCache(HeapObject o);
 
-    // Lookup object in the map. Return its index if found, or create
-    // a new entry with new_index as value, and return kInvalidIndex.
-    int LookupOrInsert(HeapObject* obj, int new_index) {
-      HashMap::Entry* entry = LookupEntry(&map_, obj, false);
-      if (entry != NULL) return GetValue(entry);
-      SetValue(LookupEntry(&map_, obj, true), static_cast<uint32_t>(new_index));
-      return kInvalidIndex;
-    }
+  bool SerializeJSObjectWithEmbedderFields(Object obj);
 
-   private:
-    HashMap map_;
+  void CheckRehashability(HeapObject obj);
 
-    DISALLOW_COPY_AND_ASSIGN(PartialCacheIndexMap);
-  };
+  StartupSerializer* startup_serializer_;
+  v8::SerializeEmbedderFieldsCallback serialize_embedder_fields_;
+  // Indicates whether we only serialized hash tables that we can rehash.
+  // TODO(yangguo): generalize rehashing, and remove this flag.
+  bool can_be_rehashed_;
+  Context context_;
 
-  void SerializeObject(HeapObject* o, HowToCode how_to_code,
-                       WhereToPoint where_to_point, int skip) override;
-
-  int PartialSnapshotCacheIndex(HeapObject* o);
-  bool ShouldBeInThePartialSnapshotCache(HeapObject* o);
-
-  Serializer* startup_serializer_;
-  PartialCacheIndexMap partial_cache_index_map_;
-  int next_partial_cache_index_;
+  // Used to store serialized data for embedder fields.
+  SnapshotByteSink embedder_fields_sink_;
   DISALLOW_COPY_AND_ASSIGN(PartialSerializer);
 };
 

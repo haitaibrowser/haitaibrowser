@@ -4,25 +4,22 @@
 
 // A simple interpreter for the Irregexp byte code.
 
-#ifdef V8_INTERPRETED_REGEXP
-
 #include "src/regexp/interpreter-irregexp.h"
 
 #include "src/ast/ast.h"
+#include "src/objects-inl.h"
 #include "src/regexp/bytecodes-irregexp.h"
 #include "src/regexp/jsregexp.h"
 #include "src/regexp/regexp-macro-assembler.h"
 #include "src/unicode.h"
 #include "src/utils.h"
 
-#ifdef V8_I18N_SUPPORT
+#ifdef V8_INTL_SUPPORT
 #include "unicode/uchar.h"
-#endif  // V8_I18N_SUPPORT
+#endif  // V8_INTL_SUPPORT
 
 namespace v8 {
 namespace internal {
-
-typedef unibrow::Mapping<unibrow::Ecma262Canonicalize> Canonicalize;
 
 static bool BackRefMatchesNoCase(Isolate* isolate, int from, int current,
                                  int len, Vector<const uc16> subject,
@@ -113,13 +110,13 @@ static void TraceInterpreter(const byte* code_base,
 
 
 static int32_t Load32Aligned(const byte* pc) {
-  DCHECK((reinterpret_cast<intptr_t>(pc) & 3) == 0);
+  DCHECK_EQ(0, reinterpret_cast<intptr_t>(pc) & 3);
   return *reinterpret_cast<const int32_t *>(pc);
 }
 
 
 static int32_t Load16Aligned(const byte* pc) {
-  DCHECK((reinterpret_cast<intptr_t>(pc) & 1) == 0);
+  DCHECK_EQ(0, reinterpret_cast<intptr_t>(pc) & 1);
   return *reinterpret_cast<const uint16_t *>(pc);
 }
 
@@ -148,15 +145,82 @@ class BacktrackStack {
   DISALLOW_COPY_AND_ASSIGN(BacktrackStack);
 };
 
+namespace {
+
+IrregexpInterpreter::Result StackOverflow(Isolate* isolate) {
+  // We abort interpreter execution after the stack overflow is thrown, and thus
+  // allow allocation here despite the outer DisallowHeapAllocationScope.
+  AllowHeapAllocation yes_gc;
+  isolate->StackOverflow();
+  return IrregexpInterpreter::EXCEPTION;
+}
+
+// Runs all pending interrupts. Callers must update unhandlified object
+// references after this function completes.
+IrregexpInterpreter::Result HandleInterrupts(Isolate* isolate,
+                                             Handle<String> subject_string) {
+  DisallowHeapAllocation no_gc;
+
+  StackLimitCheck check(isolate);
+  if (check.JsHasOverflowed()) {
+    // A real stack overflow.
+    return StackOverflow(isolate);
+  }
+
+  const bool was_one_byte =
+      String::IsOneByteRepresentationUnderneath(*subject_string);
+
+  Object result;
+  {
+    AllowHeapAllocation yes_gc;
+    result = isolate->stack_guard()->HandleInterrupts();
+  }
+
+  if (result->IsException(isolate)) {
+    return IrregexpInterpreter::EXCEPTION;
+  }
+
+  // If we changed between a LATIN1 and a UC16 string, we need to restart
+  // regexp matching with the appropriate template instantiation of RawMatch.
+  if (String::IsOneByteRepresentationUnderneath(*subject_string) !=
+      was_one_byte) {
+    return IrregexpInterpreter::RETRY;
+  }
+
+  return IrregexpInterpreter::SUCCESS;
+}
 
 template <typename Char>
-static RegExpImpl::IrregexpResult RawMatch(Isolate* isolate,
-                                           const byte* code_base,
-                                           Vector<const Char> subject,
-                                           int* registers,
-                                           int current,
-                                           uint32_t current_char) {
-  const byte* pc = code_base;
+void UpdateCodeAndSubjectReferences(Isolate* isolate,
+                                    Handle<ByteArray> code_array,
+                                    Handle<String> subject_string,
+                                    const byte** code_base_out,
+                                    const byte** pc_out,
+                                    Vector<const Char>* subject_string_out) {
+  DisallowHeapAllocation no_gc;
+
+  if (*code_base_out != code_array->GetDataStartAddress()) {
+    const intptr_t pc_offset = *pc_out - *code_base_out;
+    DCHECK_GT(pc_offset, 0);
+    *code_base_out = code_array->GetDataStartAddress();
+    *pc_out = *code_base_out + pc_offset;
+  }
+
+  DCHECK(subject_string->IsFlat());
+  *subject_string_out = subject_string->GetCharVector<Char>(no_gc);
+}
+
+template <typename Char>
+IrregexpInterpreter::Result RawMatch(Isolate* isolate,
+                                     Handle<ByteArray> code_array,
+                                     Handle<String> subject_string,
+                                     Vector<const Char> subject, int* registers,
+                                     int current, uint32_t current_char) {
+  DisallowHeapAllocation no_gc;
+
+  const byte* pc = code_array->GetDataStartAddress();
+  const byte* code_base = pc;
+
   // BacktrackStack ensures that the memory allocated for the backtracking stack
   // is returned to the system or cached if there is no stack being cached at
   // the moment.
@@ -174,24 +238,23 @@ static RegExpImpl::IrregexpResult RawMatch(Isolate* isolate,
     switch (insn & BYTECODE_MASK) {
       BYTECODE(BREAK)
         UNREACHABLE();
-        return RegExpImpl::RE_FAILURE;
       BYTECODE(PUSH_CP)
         if (--backtrack_stack_space < 0) {
-          return RegExpImpl::RE_EXCEPTION;
+          return StackOverflow(isolate);
         }
         *backtrack_sp++ = current;
         pc += BC_PUSH_CP_LENGTH;
         break;
       BYTECODE(PUSH_BT)
         if (--backtrack_stack_space < 0) {
-          return RegExpImpl::RE_EXCEPTION;
+          return StackOverflow(isolate);
         }
         *backtrack_sp++ = Load32Aligned(pc + 4);
         pc += BC_PUSH_BT_LENGTH;
         break;
       BYTECODE(PUSH_REGISTER)
         if (--backtrack_stack_space < 0) {
-          return RegExpImpl::RE_EXCEPTION;
+          return StackOverflow(isolate);
         }
         *backtrack_sp++ = registers[insn >> BYTECODE_SHIFT];
         pc += BC_PUSH_REGISTER_LENGTH;
@@ -229,21 +292,30 @@ static RegExpImpl::IrregexpResult RawMatch(Isolate* isolate,
         current = *backtrack_sp;
         pc += BC_POP_CP_LENGTH;
         break;
-      BYTECODE(POP_BT)
+        // clang-format off
+      BYTECODE(POP_BT) {
+        IrregexpInterpreter::Result return_code = HandleInterrupts(
+            isolate, subject_string);
+        if (return_code != IrregexpInterpreter::SUCCESS) return return_code;
+
+        UpdateCodeAndSubjectReferences(isolate, code_array, subject_string,
+            &code_base, &pc, &subject);
+
         backtrack_stack_space++;
         --backtrack_sp;
         pc = code_base + *backtrack_sp;
         break;
-      BYTECODE(POP_REGISTER)
+      }
+      BYTECODE(POP_REGISTER)  // clang-format on
         backtrack_stack_space++;
         --backtrack_sp;
         registers[insn >> BYTECODE_SHIFT] = *backtrack_sp;
         pc += BC_POP_REGISTER_LENGTH;
         break;
       BYTECODE(FAIL)
-        return RegExpImpl::RE_FAILURE;
+      return IrregexpInterpreter::FAILURE;
       BYTECODE(SUCCEED)
-        return RegExpImpl::RE_SUCCESS;
+      return IrregexpInterpreter::SUCCESS;
       BYTECODE(ADVANCE_CP)
         current += insn >> BYTECODE_SHIFT;
         pc += BC_ADVANCE_CP_LENGTH;
@@ -300,7 +372,7 @@ static RegExpImpl::IrregexpResult RawMatch(Isolate* isolate,
         break;
       }
       BYTECODE(LOAD_4_CURRENT_CHARS) {
-        DCHECK(sizeof(Char) == 1);
+        DCHECK_EQ(1, sizeof(Char));
         int pos = current + (insn >> BYTECODE_SHIFT);
         if (pos + 4 > subject.length() || pos < 0) {
           pc = code_base + Load32Aligned(pc + 4);
@@ -317,7 +389,7 @@ static RegExpImpl::IrregexpResult RawMatch(Isolate* isolate,
         break;
       }
       BYTECODE(LOAD_4_CURRENT_CHARS_UNCHECKED) {
-        DCHECK(sizeof(Char) == 1);
+        DCHECK_EQ(1, sizeof(Char));
         int pos = current + (insn >> BYTECODE_SHIFT);
         Char next1 = subject[pos + 1];
         Char next2 = subject[pos + 2];
@@ -519,6 +591,7 @@ static RegExpImpl::IrregexpResult RawMatch(Isolate* isolate,
         break;
       }
       BYTECODE(CHECK_NOT_BACK_REF_NO_CASE_UNICODE)
+      V8_FALLTHROUGH;
       BYTECODE(CHECK_NOT_BACK_REF_NO_CASE) {
         bool unicode =
             (insn & BYTECODE_MASK) == BC_CHECK_NOT_BACK_REF_NO_CASE_UNICODE;
@@ -537,6 +610,7 @@ static RegExpImpl::IrregexpResult RawMatch(Isolate* isolate,
         break;
       }
       BYTECODE(CHECK_NOT_BACK_REF_NO_CASE_UNICODE_BACKWARD)
+      V8_FALLTHROUGH;
       BYTECODE(CHECK_NOT_BACK_REF_NO_CASE_BACKWARD) {
         bool unicode = (insn & BYTECODE_MASK) ==
                        BC_CHECK_NOT_BACK_REF_NO_CASE_UNICODE_BACKWARD;
@@ -584,42 +658,36 @@ static RegExpImpl::IrregexpResult RawMatch(Isolate* isolate,
   }
 }
 
+}  // namespace
 
-RegExpImpl::IrregexpResult IrregexpInterpreter::Match(
-    Isolate* isolate,
-    Handle<ByteArray> code_array,
-    Handle<String> subject,
-    int* registers,
-    int start_position) {
-  DCHECK(subject->IsFlat());
+// static
+IrregexpInterpreter::Result IrregexpInterpreter::Match(
+    Isolate* isolate, Handle<ByteArray> code_array,
+    Handle<String> subject_string, int* registers, int start_position) {
+  DCHECK(subject_string->IsFlat());
 
+  // Note: Heap allocation *is* allowed in two situations:
+  // 1. When creating & throwing a stack overflow exception. The interpreter
+  //    aborts afterwards, and thus possible-moved objects are never used.
+  // 2. When handling interrupts. We manually relocate unhandlified references
+  //    after interrupts have run.
   DisallowHeapAllocation no_gc;
-  const byte* code_base = code_array->GetDataStartAddress();
+
   uc16 previous_char = '\n';
-  String::FlatContent subject_content = subject->GetFlatContent();
+  String::FlatContent subject_content = subject_string->GetFlatContent(no_gc);
   if (subject_content.IsOneByte()) {
     Vector<const uint8_t> subject_vector = subject_content.ToOneByteVector();
     if (start_position != 0) previous_char = subject_vector[start_position - 1];
-    return RawMatch(isolate,
-                    code_base,
-                    subject_vector,
-                    registers,
-                    start_position,
-                    previous_char);
+    return RawMatch(isolate, code_array, subject_string, subject_vector,
+                    registers, start_position, previous_char);
   } else {
     DCHECK(subject_content.IsTwoByte());
     Vector<const uc16> subject_vector = subject_content.ToUC16Vector();
     if (start_position != 0) previous_char = subject_vector[start_position - 1];
-    return RawMatch(isolate,
-                    code_base,
-                    subject_vector,
-                    registers,
-                    start_position,
-                    previous_char);
+    return RawMatch(isolate, code_array, subject_string, subject_vector,
+                    registers, start_position, previous_char);
   }
 }
 
 }  // namespace internal
 }  // namespace v8
-
-#endif  // V8_INTERPRETED_REGEXP

@@ -5,368 +5,270 @@
 #include "src/external-reference-table.h"
 
 #include "src/accessors.h"
-#include "src/assembler.h"
 #include "src/counters.h"
-#include "src/deoptimizer.h"
+#include "src/external-reference.h"
 #include "src/ic/stub-cache.h"
+
+#if defined(DEBUG) && defined(V8_OS_LINUX) && !defined(V8_OS_ANDROID)
+#define SYMBOLIZE_FUNCTION
+#include <execinfo.h>
+#include <vector>
+#endif  // DEBUG && V8_OS_LINUX && !V8_OS_ANDROID
 
 namespace v8 {
 namespace internal {
 
-ExternalReferenceTable* ExternalReferenceTable::instance(Isolate* isolate) {
-  ExternalReferenceTable* external_reference_table =
-      isolate->external_reference_table();
-  if (external_reference_table == NULL) {
-    external_reference_table = new ExternalReferenceTable(isolate);
-    isolate->set_external_reference_table(external_reference_table);
-  }
-  return external_reference_table;
+#define ADD_EXT_REF_NAME(name, desc) desc,
+#define ADD_BUILTIN_NAME(Name, ...) "Builtin_" #Name,
+#define ADD_RUNTIME_FUNCTION(name, ...) "Runtime::" #name,
+#define ADD_ISOLATE_ADDR(Name, name) "Isolate::" #name "_address",
+#define ADD_ACCESSOR_INFO_NAME(_, __, AccessorName, ...) \
+  "Accessors::" #AccessorName "Getter",
+#define ADD_ACCESSOR_SETTER_NAME(name) "Accessors::" #name,
+#define ADD_STATS_COUNTER_NAME(name, ...) "StatsCounter::" #name,
+// static
+// clang-format off
+const char* const
+    ExternalReferenceTable::ref_name_[ExternalReferenceTable::kSize] = {
+        // Special references:
+        "nullptr",
+        // External references:
+        EXTERNAL_REFERENCE_LIST(ADD_EXT_REF_NAME)
+        EXTERNAL_REFERENCE_LIST_WITH_ISOLATE(ADD_EXT_REF_NAME)
+        // Builtins:
+        BUILTIN_LIST_C(ADD_BUILTIN_NAME)
+        // Runtime functions:
+        FOR_EACH_INTRINSIC(ADD_RUNTIME_FUNCTION)
+        // Isolate addresses:
+        FOR_EACH_ISOLATE_ADDRESS_NAME(ADD_ISOLATE_ADDR)
+        // Accessors:
+        ACCESSOR_INFO_LIST_GENERATOR(ADD_ACCESSOR_INFO_NAME, /* not used */)
+        ACCESSOR_SETTER_LIST(ADD_ACCESSOR_SETTER_NAME)
+        // Stub cache:
+        "Load StubCache::primary_->key",
+        "Load StubCache::primary_->value",
+        "Load StubCache::primary_->map",
+        "Load StubCache::secondary_->key",
+        "Load StubCache::secondary_->value",
+        "Load StubCache::secondary_->map",
+        "Store StubCache::primary_->key",
+        "Store StubCache::primary_->value",
+        "Store StubCache::primary_->map",
+        "Store StubCache::secondary_->key",
+        "Store StubCache::secondary_->value",
+        "Store StubCache::secondary_->map",
+        // Native code counters:
+        STATS_COUNTER_NATIVE_CODE_LIST(ADD_STATS_COUNTER_NAME)
+};
+// clang-format on
+#undef ADD_EXT_REF_NAME
+#undef ADD_BUILTIN_NAME
+#undef ADD_RUNTIME_FUNCTION
+#undef ADD_ISOLATE_ADDR
+#undef ADD_ACCESSOR_INFO_NAME
+#undef ADD_ACCESSOR_SETTER_NAME
+#undef ADD_STATS_COUNTER_NAME
+
+// Forward declarations for C++ builtins.
+#define FORWARD_DECLARE(Name) \
+  Address Builtin_##Name(int argc, Address* args, Isolate* isolate);
+BUILTIN_LIST_C(FORWARD_DECLARE)
+#undef FORWARD_DECLARE
+
+void ExternalReferenceTable::Init(Isolate* isolate) {
+  int index = 0;
+
+  // kNullAddress is preserved through serialization/deserialization.
+  Add(kNullAddress, &index);
+  AddReferences(isolate, &index);
+  AddBuiltins(&index);
+  AddRuntimeFunctions(&index);
+  AddIsolateAddresses(isolate, &index);
+  AddAccessors(&index);
+  AddStubCache(isolate, &index);
+  AddNativeCodeStatsCounters(isolate, &index);
+  is_initialized_ = static_cast<uint32_t>(true);
+
+  CHECK_EQ(kSize, index);
 }
 
-ExternalReferenceTable::ExternalReferenceTable(Isolate* isolate) {
-  // Miscellaneous
-  Add(ExternalReference::roots_array_start(isolate).address(),
-      "Heap::roots_array_start()");
-  Add(ExternalReference::address_of_stack_limit(isolate).address(),
-      "StackGuard::address_of_jslimit()");
-  Add(ExternalReference::address_of_real_stack_limit(isolate).address(),
-      "StackGuard::address_of_real_jslimit()");
-  Add(ExternalReference::new_space_allocation_limit_address(isolate).address(),
-      "Heap::NewSpaceAllocationLimitAddress()");
-  Add(ExternalReference::new_space_allocation_top_address(isolate).address(),
-      "Heap::NewSpaceAllocationTopAddress()");
-  Add(ExternalReference::mod_two_doubles_operation(isolate).address(),
-      "mod_two_doubles");
-  // Keyed lookup cache.
-  Add(ExternalReference::keyed_lookup_cache_keys(isolate).address(),
-      "KeyedLookupCache::keys()");
-  Add(ExternalReference::keyed_lookup_cache_field_offsets(isolate).address(),
-      "KeyedLookupCache::field_offsets()");
-  Add(ExternalReference::handle_scope_next_address(isolate).address(),
-      "HandleScope::next");
-  Add(ExternalReference::handle_scope_limit_address(isolate).address(),
-      "HandleScope::limit");
-  Add(ExternalReference::handle_scope_level_address(isolate).address(),
-      "HandleScope::level");
-  Add(ExternalReference::new_deoptimizer_function(isolate).address(),
-      "Deoptimizer::New()");
-  Add(ExternalReference::compute_output_frames_function(isolate).address(),
-      "Deoptimizer::ComputeOutputFrames()");
-  Add(ExternalReference::address_of_min_int().address(),
-      "LDoubleConstant::min_int");
-  Add(ExternalReference::address_of_one_half().address(),
-      "LDoubleConstant::one_half");
-  Add(ExternalReference::isolate_address(isolate).address(), "isolate");
-  Add(ExternalReference::interpreter_dispatch_table_address(isolate).address(),
-      "Interpreter::dispatch_table_address");
-  Add(ExternalReference::interpreter_dispatch_counters(isolate).address(),
-      "Interpreter::interpreter_dispatch_counters");
-  Add(ExternalReference::address_of_negative_infinity().address(),
-      "LDoubleConstant::negative_infinity");
-  Add(ExternalReference::power_double_double_function(isolate).address(),
-      "power_double_double_function");
-  Add(ExternalReference::power_double_int_function(isolate).address(),
-      "power_double_int_function");
-  Add(ExternalReference::math_log_double_function(isolate).address(),
-      "std::log");
-  Add(ExternalReference::store_buffer_top(isolate).address(),
-      "store_buffer_top");
-  Add(ExternalReference::address_of_the_hole_nan().address(), "the_hole_nan");
-  Add(ExternalReference::get_date_field_function(isolate).address(),
-      "JSDate::GetField");
-  Add(ExternalReference::date_cache_stamp(isolate).address(),
-      "date_cache_stamp");
-  Add(ExternalReference::address_of_pending_message_obj(isolate).address(),
-      "address_of_pending_message_obj");
-  Add(ExternalReference::get_make_code_young_function(isolate).address(),
-      "Code::MakeCodeYoung");
-  Add(ExternalReference::cpu_features().address(), "cpu_features");
-  Add(ExternalReference::old_space_allocation_top_address(isolate).address(),
-      "Heap::OldSpaceAllocationTopAddress");
-  Add(ExternalReference::old_space_allocation_limit_address(isolate).address(),
-      "Heap::OldSpaceAllocationLimitAddress");
-  Add(ExternalReference::allocation_sites_list_address(isolate).address(),
-      "Heap::allocation_sites_list_address()");
-  Add(ExternalReference::address_of_uint32_bias().address(), "uint32_bias");
-  Add(ExternalReference::get_mark_code_as_executed_function(isolate).address(),
-      "Code::MarkCodeAsExecuted");
-  Add(ExternalReference::is_profiling_address(isolate).address(),
-      "CpuProfiler::is_profiling");
-  Add(ExternalReference::scheduled_exception_address(isolate).address(),
-      "Isolate::scheduled_exception");
-  Add(ExternalReference::invoke_function_callback(isolate).address(),
-      "InvokeFunctionCallback");
-  Add(ExternalReference::invoke_accessor_getter_callback(isolate).address(),
-      "InvokeAccessorGetterCallback");
-  Add(ExternalReference::wasm_f32_trunc(isolate).address(),
-      "wasm::f32_trunc_wrapper");
-  Add(ExternalReference::wasm_f32_floor(isolate).address(),
-      "wasm::f32_floor_wrapper");
-  Add(ExternalReference::wasm_f32_ceil(isolate).address(),
-      "wasm::f32_ceil_wrapper");
-  Add(ExternalReference::wasm_f32_nearest_int(isolate).address(),
-      "wasm::f32_nearest_int_wrapper");
-  Add(ExternalReference::wasm_f64_trunc(isolate).address(),
-      "wasm::f64_trunc_wrapper");
-  Add(ExternalReference::wasm_f64_floor(isolate).address(),
-      "wasm::f64_floor_wrapper");
-  Add(ExternalReference::wasm_f64_ceil(isolate).address(),
-      "wasm::f64_ceil_wrapper");
-  Add(ExternalReference::wasm_f64_nearest_int(isolate).address(),
-      "wasm::f64_nearest_int_wrapper");
-  Add(ExternalReference::wasm_int64_to_float32(isolate).address(),
-      "wasm::int64_to_float32_wrapper");
-  Add(ExternalReference::wasm_uint64_to_float32(isolate).address(),
-      "wasm::uint64_to_float32_wrapper");
-  Add(ExternalReference::wasm_int64_to_float64(isolate).address(),
-      "wasm::int64_to_float64_wrapper");
-  Add(ExternalReference::wasm_uint64_to_float64(isolate).address(),
-      "wasm::uint64_to_float64_wrapper");
-  Add(ExternalReference::wasm_float32_to_int64(isolate).address(),
-      "wasm::float32_to_int64_wrapper");
-  Add(ExternalReference::wasm_float32_to_uint64(isolate).address(),
-      "wasm::float32_to_uint64_wrapper");
-  Add(ExternalReference::wasm_float64_to_int64(isolate).address(),
-      "wasm::float64_to_int64_wrapper");
-  Add(ExternalReference::wasm_float64_to_uint64(isolate).address(),
-      "wasm::float64_to_uint64_wrapper");
-  Add(ExternalReference::wasm_int64_div(isolate).address(), "wasm::int64_div");
-  Add(ExternalReference::wasm_int64_mod(isolate).address(), "wasm::int64_mod");
-  Add(ExternalReference::wasm_uint64_div(isolate).address(),
-      "wasm::uint64_div");
-  Add(ExternalReference::wasm_uint64_mod(isolate).address(),
-      "wasm::uint64_mod");
-  Add(ExternalReference::wasm_word32_ctz(isolate).address(),
-      "wasm::word32_ctz");
-  Add(ExternalReference::wasm_word64_ctz(isolate).address(),
-      "wasm::word64_ctz");
-  Add(ExternalReference::wasm_word32_popcnt(isolate).address(),
-      "wasm::word32_popcnt");
-  Add(ExternalReference::wasm_word64_popcnt(isolate).address(),
-      "wasm::word64_popcnt");
-  Add(ExternalReference::f64_acos_wrapper_function(isolate).address(),
-      "f64_acos_wrapper");
-  Add(ExternalReference::f64_asin_wrapper_function(isolate).address(),
-      "f64_asin_wrapper");
-  Add(ExternalReference::f64_atan_wrapper_function(isolate).address(),
-      "f64_atan_wrapper");
-  Add(ExternalReference::f64_cos_wrapper_function(isolate).address(),
-      "f64_cos_wrapper");
-  Add(ExternalReference::f64_sin_wrapper_function(isolate).address(),
-      "f64_sin_wrapper");
-  Add(ExternalReference::f64_tan_wrapper_function(isolate).address(),
-      "f64_tan_wrapper");
-  Add(ExternalReference::f64_exp_wrapper_function(isolate).address(),
-      "f64_exp_wrapper");
-  Add(ExternalReference::f64_log_wrapper_function(isolate).address(),
-      "f64_log_wrapper");
-  Add(ExternalReference::f64_pow_wrapper_function(isolate).address(),
-      "f64_pow_wrapper");
-  Add(ExternalReference::f64_atan2_wrapper_function(isolate).address(),
-      "f64_atan2_wrapper");
-  Add(ExternalReference::f64_mod_wrapper_function(isolate).address(),
-      "f64_mod_wrapper");
-  Add(ExternalReference::log_enter_external_function(isolate).address(),
-      "Logger::EnterExternal");
-  Add(ExternalReference::log_leave_external_function(isolate).address(),
-      "Logger::LeaveExternal");
-  Add(ExternalReference::address_of_minus_one_half().address(),
-      "double_constants.minus_one_half");
-  Add(ExternalReference::stress_deopt_count(isolate).address(),
-      "Isolate::stress_deopt_count_address()");
-  Add(ExternalReference::virtual_handler_register(isolate).address(),
-      "Isolate::virtual_handler_register()");
-  Add(ExternalReference::virtual_slot_register(isolate).address(),
-      "Isolate::virtual_slot_register()");
-  Add(ExternalReference::runtime_function_table_address(isolate).address(),
-      "Runtime::runtime_function_table_address()");
-  Add(ExternalReference::is_tail_call_elimination_enabled_address(isolate)
-          .address(),
-      "Isolate::is_tail_call_elimination_enabled_address()");
+const char* ExternalReferenceTable::ResolveSymbol(void* address) {
+#ifdef SYMBOLIZE_FUNCTION
+  char** names = backtrace_symbols(&address, 1);
+  const char* name = names[0];
+  // The array of names is malloc'ed. However, each name string is static
+  // and do not need to be freed.
+  free(names);
+  return name;
+#else
+  return "<unresolved>";
+#endif  // SYMBOLIZE_FUNCTION
+}
 
-  // Debug addresses
-  Add(ExternalReference::debug_after_break_target_address(isolate).address(),
-      "Debug::after_break_target_address()");
-  Add(ExternalReference::debug_is_active_address(isolate).address(),
-      "Debug::is_active_address()");
-  Add(ExternalReference::debug_step_in_enabled_address(isolate).address(),
-      "Debug::step_in_enabled_address()");
+void ExternalReferenceTable::Add(Address address, int* index) {
+  ref_addr_[(*index)++] = address;
+}
 
-#ifndef V8_INTERPRETED_REGEXP
-  Add(ExternalReference::re_case_insensitive_compare_uc16(isolate).address(),
-      "NativeRegExpMacroAssembler::CaseInsensitiveCompareUC16()");
-  Add(ExternalReference::re_check_stack_guard_state(isolate).address(),
-      "RegExpMacroAssembler*::CheckStackGuardState()");
-  Add(ExternalReference::re_grow_stack(isolate).address(),
-      "NativeRegExpMacroAssembler::GrowStack()");
-  Add(ExternalReference::re_word_character_map().address(),
-      "NativeRegExpMacroAssembler::word_character_map");
-  Add(ExternalReference::address_of_regexp_stack_limit(isolate).address(),
-      "RegExpStack::limit_address()");
-  Add(ExternalReference::address_of_regexp_stack_memory_address(isolate)
-          .address(),
-      "RegExpStack::memory_address()");
-  Add(ExternalReference::address_of_regexp_stack_memory_size(isolate).address(),
-      "RegExpStack::memory_size()");
-  Add(ExternalReference::address_of_static_offsets_vector(isolate).address(),
-      "OffsetsVector::static_offsets_vector");
-#endif  // V8_INTERPRETED_REGEXP
+void ExternalReferenceTable::AddReferences(Isolate* isolate, int* index) {
+  CHECK_EQ(kSpecialReferenceCount, *index);
 
-  // The following populates all of the different type of external references
-  // into the ExternalReferenceTable.
-  //
-  // NOTE: This function was originally 100k of code.  It has since been
-  // rewritten to be mostly table driven, as the callback macro style tends to
-  // very easily cause code bloat.  Please be careful in the future when adding
-  // new references.
+#define ADD_EXTERNAL_REFERENCE(name, desc) \
+  Add(ExternalReference::name().address(), index);
+  EXTERNAL_REFERENCE_LIST(ADD_EXTERNAL_REFERENCE)
+#undef ADD_EXTERNAL_REFERENCE
 
-  struct RefTableEntry {
-    uint16_t id;
-    const char* name;
+#define ADD_EXTERNAL_REFERENCE(name, desc) \
+  Add(ExternalReference::name(isolate).address(), index);
+  EXTERNAL_REFERENCE_LIST_WITH_ISOLATE(ADD_EXTERNAL_REFERENCE)
+#undef ADD_EXTERNAL_REFERENCE
+
+  CHECK_EQ(kSpecialReferenceCount + kExternalReferenceCount, *index);
+}
+
+void ExternalReferenceTable::AddBuiltins(int* index) {
+  CHECK_EQ(kSpecialReferenceCount + kExternalReferenceCount, *index);
+
+  static const Address c_builtins[] = {
+#define DEF_ENTRY(Name, ...) FUNCTION_ADDR(&Builtin_##Name),
+      BUILTIN_LIST_C(DEF_ENTRY)
+#undef DEF_ENTRY
   };
-
-  static const RefTableEntry c_builtins[] = {
-#define DEF_ENTRY_C(name, ignored) {Builtins::c_##name, "Builtins::" #name},
-      BUILTIN_LIST_C(DEF_ENTRY_C)
-#undef DEF_ENTRY_C
-  };
-
-  for (unsigned i = 0; i < arraysize(c_builtins); ++i) {
-    ExternalReference ref(static_cast<Builtins::CFunctionId>(c_builtins[i].id),
-                          isolate);
-    Add(ref.address(), c_builtins[i].name);
+  for (Address addr : c_builtins) {
+    Add(ExternalReference::Create(addr).address(), index);
   }
 
-  static const RefTableEntry builtins[] = {
-#define DEF_ENTRY_C(name, ignored) {Builtins::k##name, "Builtins::" #name},
-#define DEF_ENTRY_A(name, i1, i2, i3) {Builtins::k##name, "Builtins::" #name},
-      BUILTIN_LIST_C(DEF_ENTRY_C) BUILTIN_LIST_A(DEF_ENTRY_A)
-          BUILTIN_LIST_DEBUG_A(DEF_ENTRY_A)
-#undef DEF_ENTRY_C
-#undef DEF_ENTRY_A
-  };
+  CHECK_EQ(kSpecialReferenceCount + kExternalReferenceCount +
+               kBuiltinsReferenceCount,
+           *index);
+}
 
-  for (unsigned i = 0; i < arraysize(builtins); ++i) {
-    ExternalReference ref(static_cast<Builtins::Name>(builtins[i].id), isolate);
-    Add(ref.address(), builtins[i].name);
-  }
+void ExternalReferenceTable::AddRuntimeFunctions(int* index) {
+  CHECK_EQ(kSpecialReferenceCount + kExternalReferenceCount +
+               kBuiltinsReferenceCount,
+           *index);
 
-  static const RefTableEntry runtime_functions[] = {
-#define RUNTIME_ENTRY(name, i1, i2) {Runtime::k##name, "Runtime::" #name},
+  static constexpr Runtime::FunctionId runtime_functions[] = {
+#define RUNTIME_ENTRY(name, ...) Runtime::k##name,
       FOR_EACH_INTRINSIC(RUNTIME_ENTRY)
 #undef RUNTIME_ENTRY
   };
 
-  for (unsigned i = 0; i < arraysize(runtime_functions); ++i) {
-    ExternalReference ref(
-        static_cast<Runtime::FunctionId>(runtime_functions[i].id), isolate);
-    Add(ref.address(), runtime_functions[i].name);
+  for (Runtime::FunctionId fId : runtime_functions) {
+    Add(ExternalReference::Create(fId).address(), index);
   }
 
-  // Stat counters
-  struct StatsRefTableEntry {
-    StatsCounter* (Counters::*counter)();
-    const char* name;
-  };
+  CHECK_EQ(kSpecialReferenceCount + kExternalReferenceCount +
+               kBuiltinsReferenceCount + kRuntimeReferenceCount,
+           *index);
+}
 
-  static const StatsRefTableEntry stats_ref_table[] = {
-#define COUNTER_ENTRY(name, caption) {&Counters::name, "Counters::" #name},
-      STATS_COUNTER_LIST_1(COUNTER_ENTRY) STATS_COUNTER_LIST_2(COUNTER_ENTRY)
-#undef COUNTER_ENTRY
-  };
+void ExternalReferenceTable::AddIsolateAddresses(Isolate* isolate, int* index) {
+  CHECK_EQ(kSpecialReferenceCount + kExternalReferenceCount +
+               kBuiltinsReferenceCount + kRuntimeReferenceCount,
+           *index);
 
-  Counters* counters = isolate->counters();
-  for (unsigned i = 0; i < arraysize(stats_ref_table); ++i) {
-    // To make sure the indices are not dependent on whether counters are
-    // enabled, use a dummy address as filler.
-    Address address = NotAvailable();
-    StatsCounter* counter = (counters->*(stats_ref_table[i].counter))();
-    if (counter->Enabled()) {
-      address = reinterpret_cast<Address>(counter->GetInternalPointer());
-    }
-    Add(address, stats_ref_table[i].name);
+  for (int i = 0; i < IsolateAddressId::kIsolateAddressCount; ++i) {
+    Add(isolate->get_address_from_id(static_cast<IsolateAddressId>(i)), index);
   }
 
-  // Top addresses
-  static const char* address_names[] = {
-#define BUILD_NAME_LITERAL(Name, name) "Isolate::" #name "_address",
-      FOR_EACH_ISOLATE_ADDRESS_NAME(BUILD_NAME_LITERAL) NULL
-#undef BUILD_NAME_LITERAL
-  };
+  CHECK_EQ(kSpecialReferenceCount + kExternalReferenceCount +
+               kBuiltinsReferenceCount + kRuntimeReferenceCount +
+               kIsolateAddressReferenceCount,
+           *index);
+}
 
-  for (int i = 0; i < Isolate::kIsolateAddressCount; ++i) {
-    Add(isolate->get_address_from_id(static_cast<Isolate::AddressId>(i)),
-        address_names[i]);
-  }
+void ExternalReferenceTable::AddAccessors(int* index) {
+  CHECK_EQ(kSpecialReferenceCount + kExternalReferenceCount +
+               kBuiltinsReferenceCount + kRuntimeReferenceCount +
+               kIsolateAddressReferenceCount,
+           *index);
 
-  // Accessors
-  struct AccessorRefTable {
-    Address address;
-    const char* name;
-  };
-
-  static const AccessorRefTable getters[] = {
-#define ACCESSOR_INFO_DECLARATION(name) \
-  {FUNCTION_ADDR(&Accessors::name##Getter), "Accessors::" #name "Getter"},
-      ACCESSOR_INFO_LIST(ACCESSOR_INFO_DECLARATION)
+  static const Address accessors[] = {
+  // Getters:
+#define ACCESSOR_INFO_DECLARATION(_, __, AccessorName, ...) \
+  FUNCTION_ADDR(&Accessors::AccessorName##Getter),
+      ACCESSOR_INFO_LIST_GENERATOR(ACCESSOR_INFO_DECLARATION, /* not used */)
 #undef ACCESSOR_INFO_DECLARATION
-  };
-  static const AccessorRefTable setters[] = {
-#define ACCESSOR_SETTER_DECLARATION(name) \
-  {FUNCTION_ADDR(&Accessors::name), "Accessors::" #name},
-      ACCESSOR_SETTER_LIST(ACCESSOR_SETTER_DECLARATION)
-#undef ACCESSOR_INFO_DECLARATION
+  // Setters:
+#define ACCESSOR_SETTER_DECLARATION(name) FUNCTION_ADDR(&Accessors::name),
+          ACCESSOR_SETTER_LIST(ACCESSOR_SETTER_DECLARATION)
+#undef ACCESSOR_SETTER_DECLARATION
   };
 
-  for (unsigned i = 0; i < arraysize(getters); ++i) {
-    Add(getters[i].address, getters[i].name);
-    Add(AccessorInfo::redirect(isolate, getters[i].address, ACCESSOR_GETTER),
-        "");
+  for (Address addr : accessors) {
+    Add(addr, index);
   }
 
-  for (unsigned i = 0; i < arraysize(setters); ++i) {
-    Add(setters[i].address, setters[i].name);
-  }
+  CHECK_EQ(kSpecialReferenceCount + kExternalReferenceCount +
+               kBuiltinsReferenceCount + kRuntimeReferenceCount +
+               kIsolateAddressReferenceCount + kAccessorReferenceCount,
+           *index);
+}
 
-  StubCache* stub_cache = isolate->stub_cache();
+void ExternalReferenceTable::AddStubCache(Isolate* isolate, int* index) {
+  CHECK_EQ(kSpecialReferenceCount + kExternalReferenceCount +
+               kBuiltinsReferenceCount + kRuntimeReferenceCount +
+               kIsolateAddressReferenceCount + kAccessorReferenceCount,
+           *index);
+
+  StubCache* load_stub_cache = isolate->load_stub_cache();
 
   // Stub cache tables
-  Add(stub_cache->key_reference(StubCache::kPrimary).address(),
-      "StubCache::primary_->key");
-  Add(stub_cache->value_reference(StubCache::kPrimary).address(),
-      "StubCache::primary_->value");
-  Add(stub_cache->map_reference(StubCache::kPrimary).address(),
-      "StubCache::primary_->map");
-  Add(stub_cache->key_reference(StubCache::kSecondary).address(),
-      "StubCache::secondary_->key");
-  Add(stub_cache->value_reference(StubCache::kSecondary).address(),
-      "StubCache::secondary_->value");
-  Add(stub_cache->map_reference(StubCache::kSecondary).address(),
-      "StubCache::secondary_->map");
+  Add(load_stub_cache->key_reference(StubCache::kPrimary).address(), index);
+  Add(load_stub_cache->value_reference(StubCache::kPrimary).address(), index);
+  Add(load_stub_cache->map_reference(StubCache::kPrimary).address(), index);
+  Add(load_stub_cache->key_reference(StubCache::kSecondary).address(), index);
+  Add(load_stub_cache->value_reference(StubCache::kSecondary).address(), index);
+  Add(load_stub_cache->map_reference(StubCache::kSecondary).address(), index);
 
-  // Runtime entries
-  Add(ExternalReference::delete_handle_scope_extensions(isolate).address(),
-      "HandleScope::DeleteExtensions");
-  Add(ExternalReference::incremental_marking_record_write_function(isolate)
-          .address(),
-      "IncrementalMarking::RecordWrite");
-  Add(ExternalReference::incremental_marking_record_write_code_entry_function(
-          isolate)
-          .address(),
-      "IncrementalMarking::RecordWriteOfCodeEntryFromCode");
-  Add(ExternalReference::store_buffer_overflow_function(isolate).address(),
-      "StoreBuffer::StoreBufferOverflow");
+  StubCache* store_stub_cache = isolate->store_stub_cache();
 
-  // Add a small set of deopt entry addresses to encoder without generating the
-  // deopt table code, which isn't possible at deserialization time.
-  HandleScope scope(isolate);
-  for (int entry = 0; entry < kDeoptTableSerializeEntryCount; ++entry) {
-    Address address = Deoptimizer::GetDeoptimizationEntry(
-        isolate, entry, Deoptimizer::LAZY,
-        Deoptimizer::CALCULATE_ENTRY_ADDRESS);
-    Add(address, "lazy_deopt");
-  }
+  // Stub cache tables
+  Add(store_stub_cache->key_reference(StubCache::kPrimary).address(), index);
+  Add(store_stub_cache->value_reference(StubCache::kPrimary).address(), index);
+  Add(store_stub_cache->map_reference(StubCache::kPrimary).address(), index);
+  Add(store_stub_cache->key_reference(StubCache::kSecondary).address(), index);
+  Add(store_stub_cache->value_reference(StubCache::kSecondary).address(),
+      index);
+  Add(store_stub_cache->map_reference(StubCache::kSecondary).address(), index);
+
+  CHECK_EQ(kSpecialReferenceCount + kExternalReferenceCount +
+               kBuiltinsReferenceCount + kRuntimeReferenceCount +
+               kIsolateAddressReferenceCount + kAccessorReferenceCount +
+               kStubCacheReferenceCount,
+           *index);
+}
+
+Address ExternalReferenceTable::GetStatsCounterAddress(StatsCounter* counter) {
+  int* address = counter->Enabled()
+                     ? counter->GetInternalPointer()
+                     : reinterpret_cast<int*>(&dummy_stats_counter_);
+  return reinterpret_cast<Address>(address);
+}
+
+void ExternalReferenceTable::AddNativeCodeStatsCounters(Isolate* isolate,
+                                                        int* index) {
+  CHECK_EQ(kSpecialReferenceCount + kExternalReferenceCount +
+               kBuiltinsReferenceCount + kRuntimeReferenceCount +
+               kIsolateAddressReferenceCount + kAccessorReferenceCount +
+               kStubCacheReferenceCount,
+           *index);
+
+  Counters* counters = isolate->counters();
+
+#define SC(name, caption) Add(GetStatsCounterAddress(counters->name()), index);
+  STATS_COUNTER_NATIVE_CODE_LIST(SC)
+#undef SC
+
+  CHECK_EQ(kSpecialReferenceCount + kExternalReferenceCount +
+               kBuiltinsReferenceCount + kRuntimeReferenceCount +
+               kIsolateAddressReferenceCount + kAccessorReferenceCount +
+               kStubCacheReferenceCount + kStatsCountersReferenceCount,
+           *index);
+  CHECK_EQ(kSize, *index);
 }
 
 }  // namespace internal
 }  // namespace v8
+
+#undef SYMBOLIZE_FUNCTION

@@ -5,9 +5,13 @@
 #ifndef V8_SNAPSHOT_SERIALIZER_H_
 #define V8_SNAPSHOT_SERIALIZER_H_
 
+#include <map>
+
 #include "src/isolate.h"
 #include "src/log.h"
 #include "src/objects.h"
+#include "src/snapshot/embedded-data.h"
+#include "src/snapshot/serializer-allocator.h"
 #include "src/snapshot/serializer-common.h"
 #include "src/snapshot/snapshot-source-sink.h"
 
@@ -16,20 +20,20 @@ namespace internal {
 
 class CodeAddressMap : public CodeEventLogger {
  public:
-  explicit CodeAddressMap(Isolate* isolate) : isolate_(isolate) {
-    isolate->logger()->addCodeEventListener(this);
+  explicit CodeAddressMap(Isolate* isolate) : CodeEventLogger(isolate) {
+    isolate->logger()->AddCodeEventListener(this);
   }
 
   ~CodeAddressMap() override {
-    isolate_->logger()->removeCodeEventListener(this);
+    isolate_->logger()->RemoveCodeEventListener(this);
   }
 
-  void CodeMoveEvent(AbstractCode* from, Address to) override {
-    address_to_name_map_.Move(from->address(), to);
+  void CodeMoveEvent(AbstractCode from, AbstractCode to) override {
+    address_to_name_map_.Move(from->address(), to->address());
   }
 
-  void CodeDisableOptEvent(AbstractCode* code,
-                           SharedFunctionInfo* shared) override {}
+  void CodeDisableOptEvent(AbstractCode code,
+                           SharedFunctionInfo shared) override {}
 
   const char* Lookup(Address address) {
     return address_to_name_map_.Lookup(address);
@@ -38,29 +42,31 @@ class CodeAddressMap : public CodeEventLogger {
  private:
   class NameMap {
    public:
-    NameMap() : impl_(HashMap::PointersMatch) {}
+    NameMap() : impl_() {}
 
     ~NameMap() {
-      for (HashMap::Entry* p = impl_.Start(); p != NULL; p = impl_.Next(p)) {
+      for (base::HashMap::Entry* p = impl_.Start(); p != nullptr;
+           p = impl_.Next(p)) {
         DeleteArray(static_cast<const char*>(p->value));
       }
     }
 
     void Insert(Address code_address, const char* name, int name_size) {
-      HashMap::Entry* entry = FindOrCreateEntry(code_address);
-      if (entry->value == NULL) {
+      base::HashMap::Entry* entry = FindOrCreateEntry(code_address);
+      if (entry->value == nullptr) {
         entry->value = CopyName(name, name_size);
       }
     }
 
     const char* Lookup(Address code_address) {
-      HashMap::Entry* entry = FindEntry(code_address);
-      return (entry != NULL) ? static_cast<const char*>(entry->value) : NULL;
+      base::HashMap::Entry* entry = FindEntry(code_address);
+      return (entry != nullptr) ? static_cast<const char*>(entry->value)
+                                : nullptr;
     }
 
     void Remove(Address code_address) {
-      HashMap::Entry* entry = FindEntry(code_address);
-      if (entry != NULL) {
+      base::HashMap::Entry* entry = FindEntry(code_address);
+      if (entry != nullptr) {
         DeleteArray(static_cast<char*>(entry->value));
         RemoveEntry(entry);
       }
@@ -68,12 +74,12 @@ class CodeAddressMap : public CodeEventLogger {
 
     void Move(Address from, Address to) {
       if (from == to) return;
-      HashMap::Entry* from_entry = FindEntry(from);
-      DCHECK(from_entry != NULL);
+      base::HashMap::Entry* from_entry = FindEntry(from);
+      DCHECK_NOT_NULL(from_entry);
       void* value = from_entry->value;
       RemoveEntry(from_entry);
-      HashMap::Entry* to_entry = FindOrCreateEntry(to);
-      DCHECK(to_entry->value == NULL);
+      base::HashMap::Entry* to_entry = FindOrCreateEntry(to);
+      DCHECK_NULL(to_entry->value);
       to_entry->value = value;
     }
 
@@ -89,51 +95,83 @@ class CodeAddressMap : public CodeEventLogger {
       return result;
     }
 
-    HashMap::Entry* FindOrCreateEntry(Address code_address) {
-      return impl_.LookupOrInsert(code_address,
-                                  ComputePointerHash(code_address));
+    base::HashMap::Entry* FindOrCreateEntry(Address code_address) {
+      return impl_.LookupOrInsert(reinterpret_cast<void*>(code_address),
+                                  ComputeAddressHash(code_address));
     }
 
-    HashMap::Entry* FindEntry(Address code_address) {
-      return impl_.Lookup(code_address, ComputePointerHash(code_address));
+    base::HashMap::Entry* FindEntry(Address code_address) {
+      return impl_.Lookup(reinterpret_cast<void*>(code_address),
+                          ComputeAddressHash(code_address));
     }
 
-    void RemoveEntry(HashMap::Entry* entry) {
+    void RemoveEntry(base::HashMap::Entry* entry) {
       impl_.Remove(entry->key, entry->hash);
     }
 
-    HashMap impl_;
+    base::HashMap impl_;
 
     DISALLOW_COPY_AND_ASSIGN(NameMap);
   };
 
-  void LogRecordedBuffer(AbstractCode* code, SharedFunctionInfo*,
+  void LogRecordedBuffer(AbstractCode code, SharedFunctionInfo,
                          const char* name, int length) override {
     address_to_name_map_.Insert(code->address(), name, length);
   }
 
+  void LogRecordedBuffer(const wasm::WasmCode* code, const char* name,
+                         int length) override {
+    UNREACHABLE();
+  }
+
   NameMap address_to_name_map_;
-  Isolate* isolate_;
 };
 
-// There can be only one serializer per V8 process.
+class ObjectCacheIndexMap {
+ public:
+  ObjectCacheIndexMap() : map_(), next_index_(0) {}
+
+  // If |obj| is in the map, immediately return true.  Otherwise add it to the
+  // map and return false. In either case set |*index_out| to the index
+  // associated with the map.
+  bool LookupOrInsert(HeapObject obj, int* index_out) {
+    Maybe<uint32_t> maybe_index = map_.Get(obj);
+    if (maybe_index.IsJust()) {
+      *index_out = maybe_index.FromJust();
+      return true;
+    }
+    *index_out = next_index_;
+    map_.Set(obj, next_index_++);
+    return false;
+  }
+
+ private:
+  DisallowHeapAllocation no_allocation_;
+
+  HeapObjectToIndexHashMap map_;
+  int next_index_;
+
+  DISALLOW_COPY_AND_ASSIGN(ObjectCacheIndexMap);
+};
+
 class Serializer : public SerializerDeserializer {
  public:
-  Serializer(Isolate* isolate, SnapshotByteSink* sink);
+  explicit Serializer(Isolate* isolate);
   ~Serializer() override;
 
-  void EncodeReservations(List<SerializedData::Reservation>* out) const;
+  std::vector<SerializedData::Reservation> EncodeReservations() const {
+    return allocator_.EncodeReservations();
+  }
 
-  void SerializeDeferredObjects();
+  const std::vector<byte>* Payload() const { return sink_.data(); }
+
+  bool ReferenceMapContains(HeapObject o) {
+    return reference_map()
+        ->LookupReference(reinterpret_cast<void*>(o->ptr()))
+        .is_valid();
+  }
 
   Isolate* isolate() const { return isolate_; }
-
-  SerializerReferenceMap* reference_map() { return &reference_map_; }
-  RootIndexMap* root_index_map() { return &root_index_map_; }
-
-#ifdef OBJECT_PRINT
-  void CountInstanceType(Map* map, int size);
-#endif  // OBJECT_PRINT
 
  protected:
   class ObjectSerializer;
@@ -152,170 +190,153 @@ class Serializer : public SerializerDeserializer {
     Serializer* serializer_;
   };
 
-  virtual void SerializeObject(HeapObject* o, HowToCode how_to_code,
-                               WhereToPoint where_to_point, int skip) = 0;
+  void SerializeDeferredObjects();
+  virtual void SerializeObject(HeapObject o) = 0;
 
-  void VisitPointers(Object** start, Object** end) override;
+  virtual bool MustBeDeferred(HeapObject object);
 
-  void PutRoot(int index, HeapObject* object, HowToCode how, WhereToPoint where,
-               int skip);
+  void VisitRootPointers(Root root, const char* description,
+                         FullObjectSlot start, FullObjectSlot end) override;
+  void SerializeRootObject(Object object);
 
-  void PutSmi(Smi* smi);
-
-  void PutBackReference(HeapObject* object, SerializerReference reference);
-
-  void PutAttachedReference(SerializerReference reference,
-                            HowToCode how_to_code, WhereToPoint where_to_point);
-
+  void PutRoot(RootIndex root_index, HeapObject object);
+  void PutSmi(Smi smi);
+  void PutBackReference(HeapObject object, SerializerReference reference);
+  void PutAttachedReference(SerializerReference reference);
   // Emit alignment prefix if necessary, return required padding space in bytes.
-  int PutAlignmentPrefix(HeapObject* object);
+  int PutAlignmentPrefix(HeapObject object);
+  void PutNextChunk(int space);
+  void PutRepeat(int repeat_count);
 
-  // Returns true if the object was successfully serialized.
-  bool SerializeKnownObject(HeapObject* obj, HowToCode how_to_code,
-                            WhereToPoint where_to_point, int skip);
+  // Returns true if the object was successfully serialized as a root.
+  bool SerializeRoot(HeapObject obj);
 
-  inline void FlushSkip(int skip) {
-    if (skip != 0) {
-      sink_->Put(kSkip, "SkipFromSerializeObject");
-      sink_->PutInt(skip, "SkipDistanceFromSerializeObject");
-    }
-  }
+  // Returns true if the object was successfully serialized as hot object.
+  bool SerializeHotObject(HeapObject obj);
 
-  bool BackReferenceIsAlreadyAllocated(SerializerReference back_reference);
+  // Returns true if the object was successfully serialized as back reference.
+  bool SerializeBackReference(HeapObject obj);
 
-  // This will return the space for an object.
-  SerializerReference AllocateLargeObject(int size);
-  SerializerReference Allocate(AllocationSpace space, int size);
-  int EncodeExternalReference(Address addr) {
+  // Returns true if the given heap object is a bytecode handler code object.
+  bool ObjectIsBytecodeHandler(HeapObject obj) const;
+
+  ExternalReferenceEncoder::Value EncodeExternalReference(Address addr) {
     return external_reference_encoder_.Encode(addr);
   }
 
-  bool HasNotExceededFirstPageOfEachSpace();
-
   // GetInt reads 4 bytes at once, requiring padding at the end.
-  void Pad();
+  // Use padding_offset to specify the space you want to use after padding.
+  void Pad(int padding_offset = 0);
 
   // We may not need the code address map for logging for every instance
   // of the serializer.  Initialize it on demand.
   void InitializeCodeAddressMap();
 
-  Code* CopyCode(Code* code);
+  Code CopyCode(Code code);
 
-  inline uint32_t max_chunk_size(int space) const {
-    DCHECK_LE(0, space);
-    DCHECK_LT(space, kNumberOfSpaces);
-    return max_chunk_size_[space];
-  }
-
-  SnapshotByteSink* sink() const { return sink_; }
-
-  void QueueDeferredObject(HeapObject* obj) {
-    DCHECK(reference_map_.Lookup(obj).is_back_reference());
-    deferred_objects_.Add(obj);
+  void QueueDeferredObject(HeapObject obj) {
+    DCHECK(reference_map_.LookupReference(reinterpret_cast<void*>(obj->ptr()))
+               .is_back_reference());
+    deferred_objects_.push_back(obj);
   }
 
   void OutputStatistics(const char* name);
 
-  Isolate* isolate_;
+#ifdef OBJECT_PRINT
+  void CountInstanceType(Map map, int size, AllocationSpace space);
+#endif  // OBJECT_PRINT
 
-  SnapshotByteSink* sink_;
-  ExternalReferenceEncoder external_reference_encoder_;
+#ifdef DEBUG
+  void PushStack(HeapObject o) { stack_.push_back(o); }
+  void PopStack() { stack_.pop_back(); }
+  void PrintStack();
+#endif  // DEBUG
 
-  SerializerReferenceMap reference_map_;
-  RootIndexMap root_index_map_;
+  SerializerReferenceMap* reference_map() { return &reference_map_; }
+  const RootIndexMap* root_index_map() const { return &root_index_map_; }
+  SerializerAllocator* allocator() { return &allocator_; }
 
-  int recursion_depth_;
-
-  friend class Deserializer;
-  friend class ObjectSerializer;
-  friend class RecursionScope;
-  friend class SnapshotData;
+  SnapshotByteSink sink_;  // Used directly by subclasses.
 
  private:
-  CodeAddressMap* code_address_map_;
-  // Objects from the same space are put into chunks for bulk-allocation
-  // when deserializing. We have to make sure that each chunk fits into a
-  // page. So we track the chunk size in pending_chunk_ of a space, but
-  // when it exceeds a page, we complete the current chunk and start a new one.
-  uint32_t pending_chunk_[kNumberOfPreallocatedSpaces];
-  List<uint32_t> completed_chunks_[kNumberOfPreallocatedSpaces];
-  uint32_t max_chunk_size_[kNumberOfPreallocatedSpaces];
-
-  // We map serialized large objects to indexes for back-referencing.
-  uint32_t large_objects_total_size_;
-  uint32_t seen_large_objects_index_;
-
-  List<byte> code_buffer_;
-
-  // To handle stack overflow.
-  List<HeapObject*> deferred_objects_;
+  Isolate* isolate_;
+  SerializerReferenceMap reference_map_;
+  ExternalReferenceEncoder external_reference_encoder_;
+  RootIndexMap root_index_map_;
+  CodeAddressMap* code_address_map_ = nullptr;
+  std::vector<byte> code_buffer_;
+  std::vector<HeapObject> deferred_objects_;  // To handle stack overflow.
+  int recursion_depth_ = 0;
+  SerializerAllocator allocator_;
 
 #ifdef OBJECT_PRINT
-  static const int kInstanceTypes = 256;
-  int* instance_type_count_;
-  size_t* instance_type_size_;
+  static const int kInstanceTypes = LAST_TYPE + 1;
+  int* instance_type_count_[LAST_SPACE];
+  size_t* instance_type_size_[LAST_SPACE];
 #endif  // OBJECT_PRINT
+
+#ifdef DEBUG
+  std::vector<HeapObject> stack_;
+#endif  // DEBUG
+
+  friend class SerializerAllocator;
 
   DISALLOW_COPY_AND_ASSIGN(Serializer);
 };
 
+class RelocInfoIterator;
+
 class Serializer::ObjectSerializer : public ObjectVisitor {
  public:
-  ObjectSerializer(Serializer* serializer, HeapObject* obj,
-                   SnapshotByteSink* sink, HowToCode how_to_code,
-                   WhereToPoint where_to_point)
+  ObjectSerializer(Serializer* serializer, HeapObject obj,
+                   SnapshotByteSink* sink)
       : serializer_(serializer),
         object_(obj),
         sink_(sink),
-        reference_representation_(how_to_code + where_to_point),
-        bytes_processed_so_far_(0),
-        code_has_been_output_(false) {}
-  ~ObjectSerializer() override {}
-  void Serialize();
-  void SerializeDeferred();
-  void VisitPointers(Object** start, Object** end) override;
-  void VisitEmbeddedPointer(RelocInfo* target) override;
-  void VisitExternalReference(Address* p) override;
-  void VisitExternalReference(RelocInfo* rinfo) override;
-  void VisitInternalReference(RelocInfo* rinfo) override;
-  void VisitCodeTarget(RelocInfo* target) override;
-  void VisitCodeEntry(Address entry_address) override;
-  void VisitCell(RelocInfo* rinfo) override;
-  void VisitRuntimeEntry(RelocInfo* reloc) override;
-  // Used for seralizing the external strings that hold the natives source.
-  void VisitExternalOneByteString(
-      v8::String::ExternalOneByteStringResource** resource) override;
-  // We can't serialize a heap with external two byte strings.
-  void VisitExternalTwoByteString(
-      v8::String::ExternalStringResource** resource) override {
-    UNREACHABLE();
+        bytes_processed_so_far_(0) {
+#ifdef DEBUG
+    serializer_->PushStack(obj);
+#endif  // DEBUG
   }
+  // NOLINTNEXTLINE (modernize-use-equals-default)
+  ~ObjectSerializer() override {
+#ifdef DEBUG
+    serializer_->PopStack();
+#endif  // DEBUG
+  }
+  void Serialize();
+  void SerializeObject();
+  void SerializeDeferred();
+  void VisitPointers(HeapObject host, ObjectSlot start,
+                     ObjectSlot end) override;
+  void VisitPointers(HeapObject host, MaybeObjectSlot start,
+                     MaybeObjectSlot end) override;
+  void VisitEmbeddedPointer(Code host, RelocInfo* target) override;
+  void VisitExternalReference(Foreign host, Address* p) override;
+  void VisitExternalReference(Code host, RelocInfo* rinfo) override;
+  void VisitInternalReference(Code host, RelocInfo* rinfo) override;
+  void VisitCodeTarget(Code host, RelocInfo* target) override;
+  void VisitRuntimeEntry(Code host, RelocInfo* reloc) override;
+  void VisitOffHeapTarget(Code host, RelocInfo* target) override;
 
  private:
-  void SerializePrologue(AllocationSpace space, int size, Map* map);
+  void SerializePrologue(AllocationSpace space, int size, Map map);
 
-  bool SerializeExternalNativeSourceString(
-      int builtin_count,
-      v8::String::ExternalOneByteStringResource** resource_pointer,
-      FixedArray* source_cache, int resource_index);
-
-  enum ReturnSkip { kCanReturnSkipInsteadOfSkipping, kIgnoringReturn };
   // This function outputs or skips the raw data between the last pointer and
-  // up to the current position.  It optionally can just return the number of
-  // bytes to skip instead of performing a skip instruction, in case the skip
-  // can be merged into the next instruction.
-  int OutputRawData(Address up_to, ReturnSkip return_skip = kIgnoringReturn);
-  // External strings are serialized in a way to resemble sequential strings.
+  // up to the current position.
+  void SerializeContent(Map map, int size);
+  void OutputRawData(Address up_to);
+  void OutputCode(int size);
+  int32_t SerializeBackingStore(void* backing_store, int32_t byte_length);
+  void SerializeJSTypedArray();
+  void SerializeJSArrayBuffer();
   void SerializeExternalString();
-
-  Address PrepareCode();
+  void SerializeExternalStringAsSequentialString();
 
   Serializer* serializer_;
-  HeapObject* object_;
+  HeapObject object_;
   SnapshotByteSink* sink_;
-  int reference_representation_;
   int bytes_processed_so_far_;
-  bool code_has_been_output_;
 };
 
 }  // namespace internal

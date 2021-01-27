@@ -7,120 +7,265 @@
 
 #include "src/base/flags.h"
 #include "src/compiler/graph-reducer.h"
+#include "src/deoptimize-reason.h"
+#include "src/objects/map.h"
 
 namespace v8 {
 namespace internal {
 
 // Forward declarations.
-class CompilationDependencies;
 class Factory;
 class FeedbackNexus;
-class TypeCache;
-
+class JSGlobalObject;
+class JSGlobalProxy;
+class StringConstantBase;
 
 namespace compiler {
 
 // Forward declarations.
 enum class AccessMode;
 class CommonOperatorBuilder;
+class CompilationDependencies;
+class ElementAccessInfo;
 class JSGraph;
+class JSHeapBroker;
 class JSOperatorBuilder;
 class MachineOperatorBuilder;
+class PropertyAccessInfo;
 class SimplifiedOperatorBuilder;
-
+class TypeCache;
 
 // Specializes a given JSGraph to a given native context, potentially constant
 // folding some {LoadGlobal} nodes or strength reducing some {StoreGlobal}
 // nodes.  And also specializes {LoadNamed} and {StoreNamed} nodes according
 // to type feedback (if available).
-class JSNativeContextSpecialization final : public AdvancedReducer {
+class V8_EXPORT_PRIVATE JSNativeContextSpecialization final
+    : public AdvancedReducer {
  public:
   // Flags that control the mode of operation.
   enum Flag {
     kNoFlags = 0u,
-    kBailoutOnUninitialized = 1u << 0,
-    kDeoptimizationEnabled = 1u << 1,
+    kAccessorInliningEnabled = 1u << 0,
+    kBailoutOnUninitialized = 1u << 1
   };
-  typedef base::Flags<Flag> Flags;
+  using Flags = base::Flags<Flag>;
 
-  JSNativeContextSpecialization(Editor* editor, JSGraph* jsgraph, Flags flags,
-                                MaybeHandle<Context> native_context,
+  JSNativeContextSpecialization(Editor* editor, JSGraph* jsgraph,
+                                JSHeapBroker* broker, Flags flags,
+                                Handle<Context> native_context,
                                 CompilationDependencies* dependencies,
-                                Zone* zone);
+                                Zone* zone, Zone* shared_zone);
+
+  const char* reducer_name() const override {
+    return "JSNativeContextSpecialization";
+  }
 
   Reduction Reduce(Node* node) final;
 
+  // Utility for folding string constant concatenation.
+  // Supports JSAdd nodes and nodes typed as string or number.
+  // Public for the sake of unit testing.
+  static base::Optional<size_t> GetMaxStringLength(JSHeapBroker* broker,
+                                                   Node* node);
+
  private:
+  Reduction ReduceJSAdd(Node* node);
+  Reduction ReduceJSAsyncFunctionEnter(Node* node);
+  Reduction ReduceJSAsyncFunctionReject(Node* node);
+  Reduction ReduceJSAsyncFunctionResolve(Node* node);
+  Reduction ReduceJSGetSuperConstructor(Node* node);
+  Reduction ReduceJSInstanceOf(Node* node);
+  Reduction ReduceJSHasInPrototypeChain(Node* node);
+  Reduction ReduceJSOrdinaryHasInstance(Node* node);
+  Reduction ReduceJSPromiseResolve(Node* node);
+  Reduction ReduceJSResolvePromise(Node* node);
   Reduction ReduceJSLoadContext(Node* node);
+  Reduction ReduceJSLoadGlobal(Node* node);
+  Reduction ReduceJSStoreGlobal(Node* node);
   Reduction ReduceJSLoadNamed(Node* node);
   Reduction ReduceJSStoreNamed(Node* node);
+  Reduction ReduceJSHasProperty(Node* node);
   Reduction ReduceJSLoadProperty(Node* node);
   Reduction ReduceJSStoreProperty(Node* node);
+  Reduction ReduceJSStoreNamedOwn(Node* node);
+  Reduction ReduceJSStoreDataPropertyInLiteral(Node* node);
+  Reduction ReduceJSStoreInArrayLiteral(Node* node);
+  Reduction ReduceJSToObject(Node* node);
 
   Reduction ReduceElementAccess(Node* node, Node* index, Node* value,
-                                MapHandleList const& receiver_maps,
+                                FeedbackNexus const& nexus,
+                                MapHandles const& receiver_maps,
                                 AccessMode access_mode,
-                                LanguageMode language_mode,
+                                KeyedAccessLoadMode load_mode,
                                 KeyedAccessStoreMode store_mode);
-  Reduction ReduceKeyedAccess(Node* node, Node* index, Node* value,
+  Reduction ReduceKeyedAccess(Node* node, Node* key, Node* value,
                               FeedbackNexus const& nexus,
                               AccessMode access_mode,
-                              LanguageMode language_mode,
+                              KeyedAccessLoadMode load_mode,
                               KeyedAccessStoreMode store_mode);
+  Reduction ReduceNamedAccessFromNexus(Node* node, Node* value,
+                                       FeedbackNexus const& nexus,
+                                       NameRef const& name,
+                                       AccessMode access_mode);
   Reduction ReduceNamedAccess(Node* node, Node* value,
-                              FeedbackNexus const& nexus, Handle<Name> name,
-                              AccessMode access_mode,
-                              LanguageMode language_mode);
-  Reduction ReduceNamedAccess(Node* node, Node* value,
-                              MapHandleList const& receiver_maps,
-                              Handle<Name> name, AccessMode access_mode,
-                              LanguageMode language_mode,
-                              Node* index = nullptr);
+                              MapHandles const& receiver_maps,
+                              NameRef const& name, AccessMode access_mode,
+                              Node* key = nullptr);
+  Reduction ReduceGlobalAccess(Node* node, Node* receiver, Node* value,
+                               NameRef const& name, AccessMode access_mode,
+                               Node* key = nullptr);
+  Reduction ReduceGlobalAccess(Node* node, Node* receiver, Node* value,
+                               NameRef const& name, AccessMode access_mode,
+                               Node* key, PropertyCellRef const& property_cell);
+  Reduction ReduceKeyedLoadFromHeapConstant(Node* node, Node* key,
+                                            FeedbackNexus const& nexus,
+                                            AccessMode access_mode,
+                                            KeyedAccessLoadMode load_mode);
+  Reduction ReduceElementAccessOnString(Node* node, Node* index, Node* value,
+                                        AccessMode access_mode,
+                                        KeyedAccessLoadMode load_mode);
 
-  Reduction ReduceSoftDeoptimize(Node* node);
+  Reduction ReduceSoftDeoptimize(Node* node, DeoptimizeReason reason);
+  Reduction ReduceJSToString(Node* node);
 
-  // Adds stability dependencies on all prototypes of every class in
-  // {receiver_type} up to (and including) the {holder}.
-  void AssumePrototypesStable(Type* receiver_type,
-                              Handle<Context> native_context,
-                              Handle<JSObject> holder);
+  Reduction ReduceJSLoadPropertyWithEnumeratedKey(Node* node);
+
+  const StringConstantBase* CreateDelayedStringConstant(Node* node);
+
+  // A triple of nodes that represents a continuation.
+  class ValueEffectControl final {
+   public:
+    ValueEffectControl()
+        : value_(nullptr), effect_(nullptr), control_(nullptr) {}
+    ValueEffectControl(Node* value, Node* effect, Node* control)
+        : value_(value), effect_(effect), control_(control) {}
+
+    Node* value() const { return value_; }
+    Node* effect() const { return effect_; }
+    Node* control() const { return control_; }
+
+   private:
+    Node* value_;
+    Node* effect_;
+    Node* control_;
+  };
+
+  // Construct the appropriate subgraph for property access.
+  ValueEffectControl BuildPropertyAccess(Node* receiver, Node* value,
+                                         Node* context, Node* frame_state,
+                                         Node* effect, Node* control,
+                                         NameRef const& name,
+                                         ZoneVector<Node*>* if_exceptions,
+                                         PropertyAccessInfo const& access_info,
+                                         AccessMode access_mode);
+  ValueEffectControl BuildPropertyLoad(Node* receiver, Node* context,
+                                       Node* frame_state, Node* effect,
+                                       Node* control, NameRef const& name,
+                                       ZoneVector<Node*>* if_exceptions,
+                                       PropertyAccessInfo const& access_info);
+
+  ValueEffectControl BuildPropertyStore(Node* receiver, Node* value,
+                                        Node* context, Node* frame_state,
+                                        Node* effect, Node* control,
+                                        NameRef const& name,
+                                        ZoneVector<Node*>* if_exceptions,
+                                        PropertyAccessInfo const& access_info,
+                                        AccessMode access_mode);
+
+  ValueEffectControl BuildPropertyTest(Node* effect, Node* control,
+                                       PropertyAccessInfo const& access_info);
+
+  // Helpers for accessor inlining.
+  Node* InlinePropertyGetterCall(Node* receiver, Node* context,
+                                 Node* frame_state, Node** effect,
+                                 Node** control,
+                                 ZoneVector<Node*>* if_exceptions,
+                                 PropertyAccessInfo const& access_info);
+  void InlinePropertySetterCall(Node* receiver, Node* value, Node* context,
+                                Node* frame_state, Node** effect,
+                                Node** control,
+                                ZoneVector<Node*>* if_exceptions,
+                                PropertyAccessInfo const& access_info);
+  Node* InlineApiCall(Node* receiver, Node* holder, Node* frame_state,
+                      Node* value, Node** effect, Node** control,
+                      SharedFunctionInfoRef const& shared_info,
+                      FunctionTemplateInfoRef const& function_template_info);
+
+  // Construct the appropriate subgraph for element access.
+  ValueEffectControl BuildElementAccess(
+      Node* receiver, Node* index, Node* value, Node* effect, Node* control,
+      ElementAccessInfo const& access_info, AccessMode access_mode,
+      KeyedAccessLoadMode load_mode, KeyedAccessStoreMode store_mode);
+
+  // Construct appropriate subgraph to load from a String.
+  Node* BuildIndexedStringLoad(Node* receiver, Node* index, Node* length,
+                               Node** effect, Node** control,
+                               KeyedAccessLoadMode load_mode);
+
+  // Construct appropriate subgraph to extend properties backing store.
+  Node* BuildExtendPropertiesBackingStore(const MapRef& map, Node* properties,
+                                          Node* effect, Node* control);
+
+  // Construct appropriate subgraph to check that the {value} matches
+  // the previously recorded {name} feedback.
+  Node* BuildCheckEqualsName(NameRef const& name, Node* value, Node* effect,
+                             Node* control);
+
+  // Checks if we can turn the hole into undefined when loading an element
+  // from an object with one of the {receiver_maps}; sets up appropriate
+  // code dependencies and might use the array protector cell.
+  bool CanTreatHoleAsUndefined(MapHandles const& receiver_maps);
 
   // Extract receiver maps from {nexus} and filter based on {receiver} if
   // possible.
   bool ExtractReceiverMaps(Node* receiver, Node* effect,
                            FeedbackNexus const& nexus,
-                           MapHandleList* receiver_maps);
+                           MapHandles* receiver_maps);
 
-  // Try to infer a map for the given {receiver} at the current {effect}.
-  // If a map is returned then you can be sure that the {receiver} definitely
-  // has the returned map at this point in the program (identified by {effect}).
-  MaybeHandle<Map> InferReceiverMap(Node* receiver, Node* effect);
+  // Try to infer maps for the given {receiver} at the current {effect}.
+  bool InferReceiverMaps(Node* receiver, Node* effect,
+                         MapHandles* receiver_maps);
   // Try to infer a root map for the {receiver} independent of the current
   // program location.
   MaybeHandle<Map> InferReceiverRootMap(Node* receiver);
 
-  // Retrieve the native context from the given {node} if known.
-  MaybeHandle<Context> GetNativeContext(Node* node);
+  // Checks if we know at compile time that the {receiver} either definitely
+  // has the {prototype} in it's prototype chain, or the {receiver} definitely
+  // doesn't have the {prototype} in it's prototype chain.
+  enum InferHasInPrototypeChainResult {
+    kIsInPrototypeChain,
+    kIsNotInPrototypeChain,
+    kMayBeInPrototypeChain
+  };
+  InferHasInPrototypeChainResult InferHasInPrototypeChain(
+      Node* receiver, Node* effect, Handle<HeapObject> prototype);
 
   Graph* graph() const;
   JSGraph* jsgraph() const { return jsgraph_; }
+
+  JSHeapBroker* broker() const { return broker_; }
   Isolate* isolate() const;
   Factory* factory() const;
   CommonOperatorBuilder* common() const;
   JSOperatorBuilder* javascript() const;
   SimplifiedOperatorBuilder* simplified() const;
-  MachineOperatorBuilder* machine() const;
   Flags flags() const { return flags_; }
-  MaybeHandle<Context> native_context() const { return native_context_; }
+  Handle<JSGlobalObject> global_object() const { return global_object_; }
+  Handle<JSGlobalProxy> global_proxy() const { return global_proxy_; }
+  NativeContextRef native_context() const { return broker()->native_context(); }
   CompilationDependencies* dependencies() const { return dependencies_; }
   Zone* zone() const { return zone_; }
+  Zone* shared_zone() const { return shared_zone_; }
 
   JSGraph* const jsgraph_;
+  JSHeapBroker* const broker_;
   Flags const flags_;
-  MaybeHandle<Context> native_context_;
+  Handle<JSGlobalObject> global_object_;
+  Handle<JSGlobalProxy> global_proxy_;
   CompilationDependencies* const dependencies_;
   Zone* const zone_;
-  TypeCache const& type_cache_;
+  Zone* const shared_zone_;
+  TypeCache const* type_cache_;
 
   DISALLOW_COPY_AND_ASSIGN(JSNativeContextSpecialization);
 };

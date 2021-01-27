@@ -7,17 +7,15 @@
 
 #include "src/char-predicates-inl.h"
 #include "src/dateparser.h"
-#include "src/unicode-cache-inl.h"
+#include "src/isolate.h"
 
 namespace v8 {
 namespace internal {
 
 template <typename Char>
-bool DateParser::Parse(Vector<Char> str,
-                       FixedArray* out,
-                       UnicodeCache* unicode_cache) {
+bool DateParser::Parse(Isolate* isolate, Vector<Char> str, FixedArray out) {
   DCHECK(out->length() >= OUTPUT_SIZE);
-  InputReader<Char> in(unicode_cache, str);
+  InputReader<Char> in(str);
   DateStringTokenizer<Char> scanner(&in);
   TimeZoneComposer tz;
   TimeComposer time;
@@ -76,10 +74,12 @@ bool DateParser::Parse(Vector<Char> str,
   if (next_unhandled_token.IsInvalid()) return false;
   bool has_read_number = !day.IsEmpty();
   // If there's anything left, continue with the legacy parser.
+  bool legacy_parser = false;
   for (DateToken token = next_unhandled_token;
        !token.IsEndOfInput();
        token = scanner.Next()) {
     if (token.IsNumber()) {
+      legacy_parser = true;
       has_read_number = true;
       int n = token.number();
       if (scanner.SkipSymbol(':')) {
@@ -115,6 +115,7 @@ bool DateParser::Parse(Vector<Char> str,
         scanner.SkipSymbol('-');
       }
     } else if (token.IsKeyword()) {
+      legacy_parser = true;
       // Parse a "word" (sequence of chars. >= 'A').
       KeywordType type = token.keyword_type();
       int value = token.keyword_value();
@@ -133,6 +134,7 @@ bool DateParser::Parse(Vector<Char> str,
         if (scanner.Peek().IsNumber()) return false;
       }
     } else if (token.IsAsciiSign() && (tz.IsUTC() || !time.IsEmpty())) {
+      legacy_parser = true;
       // Parse UTC offset (only after UTC or time).
       tz.SetSign(token.ascii_sign());
       // The following number may be empty.
@@ -170,9 +172,14 @@ bool DateParser::Parse(Vector<Char> str,
     }
   }
 
-  return day.Write(out) && time.Write(out) && tz.Write(out);
-}
+  bool success = day.Write(out) && time.Write(out) && tz.Write(out);
 
+  if (legacy_parser && success) {
+    isolate->CountUsage(v8::Isolate::kLegacyDateParser);
+  }
+
+  return success;
+}
 
 template<typename CharType>
 DateParser::DateToken DateParser::DateStringTokenizer<CharType>::Scan() {
@@ -189,7 +196,7 @@ DateParser::DateToken DateParser::DateStringTokenizer<CharType>::Scan() {
   if (in_->Skip('.')) return DateToken::Symbol('.');
   if (in_->Skip(')')) return DateToken::Symbol(')');
   if (in_->IsAsciiAlphaOrAbove()) {
-    DCHECK(KeywordTable::kPrefixLength == 3);
+    DCHECK_EQ(KeywordTable::kPrefixLength, 3);
     uint32_t buffer[3] = {0, 0, 0};
     int length = in_->ReadWord(buffer, 3);
     int index = KeywordTable::Lookup(buffer, length);
@@ -210,7 +217,7 @@ DateParser::DateToken DateParser::DateStringTokenizer<CharType>::Scan() {
 
 template <typename Char>
 bool DateParser::InputReader<Char>::SkipWhiteSpace() {
-  if (unicode_cache_->IsWhiteSpaceOrLineTerminator(ch_)) {
+  if (IsWhiteSpaceOrLineTerminator(ch_)) {
     Next();
     return true;
   }
@@ -334,8 +341,13 @@ DateParser::DateToken DateParser::ParseES5DateTime(
     }
     if (!scanner->Peek().IsEndOfInput()) return DateToken::Invalid();
   }
-  // Successfully parsed ES5 Date Time String. Default to UTC if no TZ given.
-  if (tz->IsEmpty()) tz->Set(0);
+  // Successfully parsed ES5 Date Time String.
+  // ES#sec-date-time-string-format Date Time String Format
+  // "When the time zone offset is absent, date-only forms are interpreted
+  //  as a UTC time and date-time forms are interpreted as a local time."
+  if (tz->IsEmpty() && time->IsEmpty()) {
+    tz->Set(0);
+  }
   day->set_iso_date();
   return DateToken::EndOfInput();
 }

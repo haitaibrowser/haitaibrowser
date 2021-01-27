@@ -5,15 +5,19 @@
 #ifndef V8_V8THREADS_H_
 #define V8_V8THREADS_H_
 
+#include <atomic>
+
 #include "src/isolate.h"
 
 namespace v8 {
 namespace internal {
 
+class RootVisitor;
+class ThreadLocalTop;
 
 class ThreadState {
  public:
-  // Returns NULL after the last one.
+  // Returns nullptr after the last one.
   ThreadState* Next();
 
   enum List {FREE_LIST, IN_USE_LIST};
@@ -51,35 +55,30 @@ class ThreadState {
   friend class ThreadManager;
 };
 
-
-// Defined in isolate.h.
-class ThreadLocalTop;
-
-
 class ThreadVisitor {
  public:
   // ThreadLocalTop may be only available during this call.
   virtual void VisitThread(Isolate* isolate, ThreadLocalTop* top) = 0;
 
  protected:
-  virtual ~ThreadVisitor() {}
+  virtual ~ThreadVisitor() = default;
 };
-
 
 class ThreadManager {
  public:
   void Lock();
   void Unlock();
 
+  void InitThread(const ExecutionAccess&);
   void ArchiveThread();
   bool RestoreThread();
   void FreeThreadResources();
   bool IsArchived();
 
-  void Iterate(ObjectVisitor* v);
+  void Iterate(RootVisitor* v);
   void IterateArchivedThreads(ThreadVisitor* v);
-  bool IsLockedByCurrentThread() {
-    return mutex_owner_.Equals(ThreadId::Current());
+  bool IsLockedByCurrentThread() const {
+    return mutex_owner_.load(std::memory_order_relaxed) == ThreadId::Current();
   }
 
   ThreadId CurrentId();
@@ -91,7 +90,7 @@ class ThreadManager {
   ThreadState* GetFreeThreadState();
 
  private:
-  ThreadManager();
+  explicit ThreadManager(Isolate* isolate);
   ~ThreadManager();
 
   void DeleteThreadStateList(ThreadState* anchor);
@@ -99,7 +98,9 @@ class ThreadManager {
   void EagerlyArchiveThread();
 
   base::Mutex mutex_;
-  ThreadId mutex_owner_;
+  // {ThreadId} must be trivially copyable to be stored in {std::atomic}.
+  ASSERT_TRIVIALLY_COPYABLE(i::ThreadId);
+  std::atomic<ThreadId> mutex_owner_;
   ThreadId lazily_archived_thread_;
   ThreadState* lazily_archived_thread_state_;
 

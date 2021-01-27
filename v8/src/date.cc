@@ -4,8 +4,12 @@
 
 #include "src/date.h"
 
-#include "src/objects.h"
+#include "src/base/overflowing-math.h"
+#include "src/conversions.h"
 #include "src/objects-inl.h"
+#ifdef V8_INTL_SUPPORT
+#include "src/objects/intl-objects.h"
+#endif
 
 namespace v8 {
 namespace internal {
@@ -21,11 +25,22 @@ static const int kYearsOffset = 400000;
 static const char kDaysInMonths[] =
     {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
 
+DateCache::DateCache()
+    : stamp_(kNullAddress),
+      tz_cache_(
+#ifdef V8_INTL_SUPPORT
+          Intl::CreateTimeZoneCache()
+#else
+          base::OS::CreateTimezoneCache()
+#endif
+              ) {
+  ResetDateCache(base::TimezoneCache::TimeZoneDetection::kSkip);
+}
 
-void DateCache::ResetDateCache() {
-  static const int kMaxStamp = Smi::kMaxValue;
-  if (stamp_->value() >= kMaxStamp) {
-    stamp_ = Smi::FromInt(0);
+void DateCache::ResetDateCache(
+    base::TimezoneCache::TimeZoneDetection time_zone_detection) {
+  if (stamp_->value() >= Smi::kMaxValue) {
+    stamp_ = Smi::zero();
   } else {
     stamp_ = Smi::FromInt(stamp_->value() + 1);
   }
@@ -36,11 +51,26 @@ void DateCache::ResetDateCache() {
   dst_usage_counter_ = 0;
   before_ = &dst_[0];
   after_ = &dst_[1];
-  local_offset_ms_ = kInvalidLocalOffsetInMs;
   ymd_valid_ = false;
-  base::OS::ClearTimezoneCache(tz_cache_);
+#ifdef V8_INTL_SUPPORT
+  if (!FLAG_icu_timezone_data) {
+#endif
+    local_offset_ms_ = kInvalidLocalOffsetInMs;
+#ifdef V8_INTL_SUPPORT
+  }
+#endif
+  tz_cache_->Clear(time_zone_detection);
+  tz_name_ = nullptr;
+  dst_tz_name_ = nullptr;
 }
 
+// ECMA 262 - ES#sec-timeclip TimeClip (time)
+double DateCache::TimeClip(double time) {
+  if (-kMaxTimeInMs <= time && time <= kMaxTimeInMs) {
+    return DoubleToInteger(time) + 0.0;
+  }
+  return std::numeric_limits<double>::quiet_NaN();
+}
 
 void DateCache::ClearSegment(DST* segment) {
   segment->start_sec = kMaxEpochTimeInSec;
@@ -91,7 +121,7 @@ void DateCache::YearMonthDayFromDays(
 
   bool is_leap = (!yd1 || yd2) && !yd3;
 
-  DCHECK(days >= -1);
+  DCHECK_GE(days, -1);
   DCHECK(is_leap || (days >= 0));
   DCHECK((days < 365) || (is_leap && (days < 366)));
   DCHECK(is_leap == ((*year % 4 == 0) && (*year % 100 || (*year % 400 == 0))));
@@ -144,8 +174,8 @@ int DateCache::DaysFromYearMonth(int year, int month) {
     month += 12;
   }
 
-  DCHECK(month >= 0);
-  DCHECK(month < 12);
+  DCHECK_GE(month, 0);
+  DCHECK_LT(month, 12);
 
   // year_delta is an arbitrary number such that:
   // a) year_delta = -1 (mod 400)
@@ -188,16 +218,80 @@ void DateCache::BreakDownTime(int64_t time_ms, int* year, int* month, int* day,
   *ms = time_in_day_ms % 1000;
 }
 
+// Implements LocalTimeZonedjustment(t, isUTC)
+// ECMA 262 - ES#sec-local-time-zone-adjustment
+int DateCache::GetLocalOffsetFromOS(int64_t time_ms, bool is_utc) {
+  double offset;
+#ifdef V8_INTL_SUPPORT
+  if (FLAG_icu_timezone_data) {
+    offset = tz_cache_->LocalTimeOffset(static_cast<double>(time_ms), is_utc);
+  } else {
+#endif
+    // When ICU timezone data is not used, we need to compute the timezone
+    // offset for a given local time.
+    //
+    // The following shows that using DST for (t - LocalTZA - hour) produces
+    // correct conversion where LocalTZA is the timezone offset in winter (no
+    // DST) and the timezone offset is assumed to have no historical change.
+    // Note that it does not work for the past and the future if LocalTZA (no
+    // DST) is different from the current LocalTZA (no DST). For instance,
+    // this will break for Europe/Moscow in 2012 ~ 2013 because LocalTZA was
+    // 4h instead of the current 3h (as of 2018).
+    //
+    // Consider transition to DST at local time L1.
+    // Let L0 = L1 - hour, L2 = L1 + hour,
+    //     U1 = UTC time that corresponds to L1,
+    //     U0 = U1 - hour.
+    // Transitioning to DST moves local clock one hour forward L1 => L2, so
+    // U0 = UTC time that corresponds to L0 = L0 - LocalTZA,
+    // U1 = UTC time that corresponds to L1 = L1 - LocalTZA,
+    // U1 = UTC time that corresponds to L2 = L2 - LocalTZA - hour.
+    // Note that DST(U0 - hour) = 0, DST(U0) = 0, DST(U1) = 1.
+    // U0 = L0 - LocalTZA - DST(L0 - LocalTZA - hour),
+    // U1 = L1 - LocalTZA - DST(L1 - LocalTZA - hour),
+    // U1 = L2 - LocalTZA - DST(L2 - LocalTZA - hour).
+    //
+    // Consider transition from DST at local time L1.
+    // Let L0 = L1 - hour,
+    //     U1 = UTC time that corresponds to L1,
+    //     U0 = U1 - hour, U2 = U1 + hour.
+    // Transitioning from DST moves local clock one hour back L1 => L0, so
+    // U0 = UTC time that corresponds to L0 (before transition)
+    //    = L0 - LocalTZA - hour.
+    // U1 = UTC time that corresponds to L0 (after transition)
+    //    = L0 - LocalTZA = L1 - LocalTZA - hour
+    // U2 = UTC time that corresponds to L1 = L1 - LocalTZA.
+    // Note that DST(U0) = 1, DST(U1) = 0, DST(U2) = 0.
+    // U0 = L0 - LocalTZA - DST(L0 - LocalTZA - hour) = L0 - LocalTZA - DST(U0).
+    // U2 = L1 - LocalTZA - DST(L1 - LocalTZA - hour) = L1 - LocalTZA - DST(U1).
+    // It is impossible to get U1 from local time.
+    if (local_offset_ms_ == kInvalidLocalOffsetInMs) {
+      // This gets the constant LocalTZA (arguments are ignored).
+      local_offset_ms_ =
+          tz_cache_->LocalTimeOffset(static_cast<double>(time_ms), is_utc);
+    }
+    offset = local_offset_ms_;
+    if (!is_utc) {
+      const int kMsPerHour = 3600 * 1000;
+      time_ms -= (offset + kMsPerHour);
+    }
+    offset += DaylightSavingsOffsetInMs(time_ms);
+#ifdef V8_INTL_SUPPORT
+  }
+#endif
+  DCHECK_LT(offset, kInvalidLocalOffsetInMs);
+  return static_cast<int>(offset);
+}
 
 void DateCache::ExtendTheAfterSegment(int time_sec, int offset_ms) {
   if (after_->offset_ms == offset_ms &&
-      after_->start_sec <= time_sec + kDefaultDSTDeltaInSec &&
+      after_->start_sec - kDefaultDSTDeltaInSec <= time_sec &&
       time_sec <= after_->end_sec) {
     // Extend the after_ segment.
     after_->start_sec = time_sec;
   } else {
     // The after_ segment is either invalid or starts too late.
-    if (after_->start_sec <= after_->end_sec) {
+    if (!InvalidSegment(after_)) {
       // If the after_ segment is valid, replace it with a new segment.
       after_ = LeastRecentlyUsedDST(before_);
     }
@@ -252,7 +346,7 @@ int DateCache::DaylightSavingsOffsetInMs(int64_t time_ms) {
     return before_->offset_ms;
   }
 
-  if (time_sec > before_->end_sec + kDefaultDSTDeltaInSec) {
+  if (time_sec - kDefaultDSTDeltaInSec > before_->end_sec) {
     // If the before_ segment ends too early, then just
     // query for the offset of the time_sec
     int offset_ms = GetDaylightSavingsOffsetFromOS(time_sec);
@@ -271,8 +365,11 @@ int DateCache::DaylightSavingsOffsetInMs(int64_t time_ms) {
 
   // Check if after_ segment is invalid or starts too late.
   // Note that start_sec of invalid segments is kMaxEpochTimeInSec.
-  if (before_->end_sec + kDefaultDSTDeltaInSec <= after_->start_sec) {
-    int new_after_start_sec = before_->end_sec + kDefaultDSTDeltaInSec;
+  int new_after_start_sec =
+      before_->end_sec < kMaxEpochTimeInSec - kDefaultDSTDeltaInSec
+          ? before_->end_sec + kDefaultDSTDeltaInSec
+          : kMaxEpochTimeInSec;
+  if (new_after_start_sec <= after_->start_sec) {
     int new_offset_ms = GetDaylightSavingsOffsetFromOS(new_after_start_sec);
     ExtendTheAfterSegment(new_after_start_sec, new_offset_ms);
   } else {
@@ -292,7 +389,7 @@ int DateCache::DaylightSavingsOffsetInMs(int64_t time_ms) {
   }
 
   // Binary search for daylight savings offset change point,
-  // but give up if we don't find it in four iterations.
+  // but give up if we don't find it in five iterations.
   for (int i = 4; i >= 0; --i) {
     int delta = after_->start_sec - before_->end_sec;
     int middle_sec = (i == 0) ? time_sec : before_->end_sec + delta / 2;
@@ -314,23 +411,22 @@ int DateCache::DaylightSavingsOffsetInMs(int64_t time_ms) {
       }
     }
   }
-  UNREACHABLE();
   return 0;
 }
 
 
 void DateCache::ProbeDST(int time_sec) {
-  DST* before = NULL;
-  DST* after = NULL;
+  DST* before = nullptr;
+  DST* after = nullptr;
   DCHECK(before_ != after_);
 
   for (int i = 0; i < kDSTSize; ++i) {
     if (dst_[i].start_sec <= time_sec) {
-      if (before == NULL || before->start_sec < dst_[i].start_sec) {
+      if (before == nullptr || before->start_sec < dst_[i].start_sec) {
         before = &dst_[i];
       }
     } else if (time_sec < dst_[i].end_sec) {
-      if (after == NULL || after->end_sec > dst_[i].end_sec) {
+      if (after == nullptr || after->end_sec > dst_[i].end_sec) {
         after = &dst_[i];
       }
     }
@@ -338,16 +434,16 @@ void DateCache::ProbeDST(int time_sec) {
 
   // If before or after segments were not found,
   // then set them to any invalid segment.
-  if (before == NULL) {
+  if (before == nullptr) {
     before = InvalidSegment(before_) ? before_ : LeastRecentlyUsedDST(after);
   }
-  if (after == NULL) {
+  if (after == nullptr) {
     after = InvalidSegment(after_) && before != after_
             ? after_ : LeastRecentlyUsedDST(before);
   }
 
-  DCHECK(before != NULL);
-  DCHECK(after != NULL);
+  DCHECK_NOT_NULL(before);
+  DCHECK_NOT_NULL(after);
   DCHECK(before != after);
   DCHECK(InvalidSegment(before) || before->start_sec <= time_sec);
   DCHECK(InvalidSegment(after) || time_sec < after->start_sec);
@@ -360,10 +456,10 @@ void DateCache::ProbeDST(int time_sec) {
 
 
 DateCache::DST* DateCache::LeastRecentlyUsedDST(DST* skip) {
-  DST* result = NULL;
+  DST* result = nullptr;
   for (int i = 0; i < kDSTSize; ++i) {
     if (&dst_[i] == skip) continue;
-    if (result == NULL || result->last_used > dst_[i].last_used) {
+    if (result == nullptr || result->last_used > dst_[i].last_used) {
       result = &dst_[i];
     }
   }

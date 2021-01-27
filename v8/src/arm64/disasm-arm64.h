@@ -2,9 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#ifndef V8_ARM64_DISASM_ARM64_H
-#define V8_ARM64_DISASM_ARM64_H
+#ifndef V8_ARM64_DISASM_ARM64_H_
+#define V8_ARM64_DISASM_ARM64_H_
 
+#include "src/arm64/assembler-arm64.h"
 #include "src/arm64/decoder-arm64.h"
 #include "src/arm64/instructions-arm64.h"
 #include "src/globals.h"
@@ -13,8 +14,7 @@
 namespace v8 {
 namespace internal {
 
-
-class DisassemblingDecoder : public DecoderVisitor {
+class V8_EXPORT_PRIVATE DisassemblingDecoder : public DecoderVisitor {
  public:
   DisassemblingDecoder();
   DisassemblingDecoder(char* text_buffer, int buffer_size);
@@ -28,6 +28,13 @@ class DisassemblingDecoder : public DecoderVisitor {
 
  protected:
   virtual void ProcessOutput(Instruction* instr);
+
+  // Default output functions.  The functions below implement a default way of
+  // printing elements in the disassembly. A sub-class can override these to
+  // customize the disassembly output.
+
+  // Prints the name of a register.
+  virtual void AppendRegisterNameToOutput(const CPURegister& reg);
 
   void Format(Instruction* instr, const char* mnemonic, const char* format);
   void Substitute(Instruction* instr, const char* string);
@@ -72,8 +79,7 @@ class DisassemblingDecoder : public DecoderVisitor {
   bool own_buffer_;
 };
 
-
-class PrintDisassembler : public DisassemblingDecoder {
+class V8_EXPORT_PRIVATE PrintDisassembler : public DisassemblingDecoder {
  public:
   explicit PrintDisassembler(FILE* stream) : stream_(stream) { }
   ~PrintDisassembler() { }
@@ -84,8 +90,7 @@ class PrintDisassembler : public DisassemblingDecoder {
   FILE *stream_;
 };
 
-
 }  // namespace internal
 }  // namespace v8
 
-#endif  // V8_ARM64_DISASM_ARM64_H
+#endif  // V8_ARM64_DISASM_ARM64_H_

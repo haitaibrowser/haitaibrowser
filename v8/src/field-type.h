@@ -5,42 +5,49 @@
 #ifndef V8_FIELD_TYPE_H_
 #define V8_FIELD_TYPE_H_
 
-#include "src/handles.h"
 #include "src/objects.h"
-#include "src/ostreams.h"
+#include "src/objects/heap-object.h"
+#include "src/objects/map.h"
 
 namespace v8 {
 namespace internal {
 
+template <typename T>
+class Handle;
+
 class FieldType : public Object {
  public:
-  static FieldType* None();
-  static FieldType* Any();
-  static Handle<FieldType> None(Isolate* isolate);
-  static Handle<FieldType> Any(Isolate* isolate);
-  static FieldType* Class(i::Map* map);
-  static Handle<FieldType> Class(i::Handle<i::Map> map, Isolate* isolate);
-  static FieldType* cast(Object* object);
-
-  bool NowContains(Object* value) {
-    if (this == Any()) return true;
-    if (this == None()) return false;
-    if (!value->IsHeapObject()) return false;
-    return HeapObject::cast(value)->map() == Map::cast(this);
+  static FieldType None();
+  static FieldType Any();
+  V8_EXPORT_PRIVATE static Handle<FieldType> None(Isolate* isolate);
+  V8_EXPORT_PRIVATE static Handle<FieldType> Any(Isolate* isolate);
+  V8_EXPORT_PRIVATE static FieldType Class(Map map);
+  V8_EXPORT_PRIVATE static Handle<FieldType> Class(Handle<Map> map,
+                                                   Isolate* isolate);
+  V8_EXPORT_PRIVATE static FieldType cast(Object object);
+  static FieldType unchecked_cast(Object object) {
+    return FieldType(object.ptr());
   }
 
-  bool NowContains(Handle<Object> value) { return NowContains(*value); }
+  bool NowContains(Object value) const;
 
-  bool IsClass();
-  Handle<i::Map> AsClass();
-  bool IsNone() { return this == None(); }
-  bool IsAny() { return this == Any(); }
-  bool NowStable();
-  bool NowIs(FieldType* other);
-  bool NowIs(Handle<FieldType> other);
-  Type* Convert(Zone* zone);
+  bool NowContains(Handle<Object> value) const { return NowContains(*value); }
 
-  void PrintTo(std::ostream& os);
+  bool IsClass() const;
+  Map AsClass() const;
+  bool IsNone() const { return *this == None(); }
+  bool IsAny() const { return *this == Any(); }
+  bool NowStable() const;
+  bool NowIs(FieldType other) const;
+  bool NowIs(Handle<FieldType> other) const;
+
+  void PrintTo(std::ostream& os) const;
+
+  FieldType* operator->() { return this; }
+  const FieldType* operator->() const { return this; }
+
+ private:
+  explicit constexpr FieldType(Address ptr) : Object(ptr) {}
 };
 
 }  // namespace internal

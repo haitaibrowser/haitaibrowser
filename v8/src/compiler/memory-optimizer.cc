@@ -10,17 +10,23 @@
 #include "src/compiler/node-properties.h"
 #include "src/compiler/node.h"
 #include "src/compiler/simplified-operator.h"
+#include "src/interface-descriptors.h"
 
 namespace v8 {
 namespace internal {
 namespace compiler {
 
-MemoryOptimizer::MemoryOptimizer(JSGraph* jsgraph, Zone* zone)
+MemoryOptimizer::MemoryOptimizer(JSGraph* jsgraph, Zone* zone,
+                                 PoisoningMitigationLevel poisoning_level,
+                                 AllocationFolding allocation_folding)
     : jsgraph_(jsgraph),
       empty_state_(AllocationState::Empty(zone)),
       pending_(zone),
       tokens_(zone),
-      zone_(zone) {}
+      zone_(zone),
+      graph_assembler_(jsgraph, nullptr, nullptr, zone),
+      poisoning_level_(poisoning_level),
+      allocation_folding_(allocation_folding) {}
 
 void MemoryOptimizer::Optimize() {
   EnqueueUses(graph()->start(), empty_state());
@@ -34,16 +40,16 @@ void MemoryOptimizer::Optimize() {
 }
 
 MemoryOptimizer::AllocationGroup::AllocationGroup(Node* node,
-                                                  PretenureFlag pretenure,
+                                                  AllocationType allocation,
                                                   Zone* zone)
-    : node_ids_(zone), pretenure_(pretenure), size_(nullptr) {
+    : node_ids_(zone), allocation_(allocation), size_(nullptr) {
   node_ids_.insert(node->id());
 }
 
 MemoryOptimizer::AllocationGroup::AllocationGroup(Node* node,
-                                                  PretenureFlag pretenure,
+                                                  AllocationType allocation,
                                                   Node* size, Zone* zone)
-    : node_ids_(zone), pretenure_(pretenure), size_(size) {
+    : node_ids_(zone), allocation_(allocation), size_(size) {
   node_ids_.insert(node->id());
 }
 
@@ -62,21 +68,130 @@ MemoryOptimizer::AllocationState::AllocationState(AllocationGroup* group)
     : group_(group), size_(std::numeric_limits<int>::max()), top_(nullptr) {}
 
 MemoryOptimizer::AllocationState::AllocationState(AllocationGroup* group,
-                                                  int size, Node* top)
+                                                  intptr_t size, Node* top)
     : group_(group), size_(size), top_(top) {}
 
-bool MemoryOptimizer::AllocationState::IsNewSpaceAllocation() const {
-  return group() && group()->IsNewSpaceAllocation();
+bool MemoryOptimizer::AllocationState::IsYoungGenerationAllocation() const {
+  return group() && group()->IsYoungGenerationAllocation();
 }
+
+namespace {
+
+bool CanAllocate(const Node* node) {
+  switch (node->opcode()) {
+    case IrOpcode::kBitcastTaggedToWord:
+    case IrOpcode::kBitcastWordToTagged:
+    case IrOpcode::kComment:
+    case IrOpcode::kDebugAbort:
+    case IrOpcode::kDebugBreak:
+    case IrOpcode::kDeoptimizeIf:
+    case IrOpcode::kDeoptimizeUnless:
+    case IrOpcode::kIfException:
+    case IrOpcode::kLoad:
+    case IrOpcode::kLoadElement:
+    case IrOpcode::kLoadField:
+    case IrOpcode::kPoisonedLoad:
+    case IrOpcode::kProtectedLoad:
+    case IrOpcode::kProtectedStore:
+    case IrOpcode::kRetain:
+    case IrOpcode::kStoreElement:
+    case IrOpcode::kStoreField:
+    case IrOpcode::kTaggedPoisonOnSpeculation:
+    case IrOpcode::kUnalignedLoad:
+    case IrOpcode::kUnalignedStore:
+    case IrOpcode::kUnsafePointerAdd:
+    case IrOpcode::kUnreachable:
+    case IrOpcode::kWord32AtomicAdd:
+    case IrOpcode::kWord32AtomicAnd:
+    case IrOpcode::kWord32AtomicCompareExchange:
+    case IrOpcode::kWord32AtomicExchange:
+    case IrOpcode::kWord32AtomicLoad:
+    case IrOpcode::kWord32AtomicOr:
+    case IrOpcode::kWord32AtomicPairAdd:
+    case IrOpcode::kWord32AtomicPairAnd:
+    case IrOpcode::kWord32AtomicPairCompareExchange:
+    case IrOpcode::kWord32AtomicPairExchange:
+    case IrOpcode::kWord32AtomicPairLoad:
+    case IrOpcode::kWord32AtomicPairOr:
+    case IrOpcode::kWord32AtomicPairStore:
+    case IrOpcode::kWord32AtomicPairSub:
+    case IrOpcode::kWord32AtomicPairXor:
+    case IrOpcode::kWord32AtomicStore:
+    case IrOpcode::kWord32AtomicSub:
+    case IrOpcode::kWord32AtomicXor:
+    case IrOpcode::kWord32PoisonOnSpeculation:
+    case IrOpcode::kWord64AtomicAdd:
+    case IrOpcode::kWord64AtomicAnd:
+    case IrOpcode::kWord64AtomicCompareExchange:
+    case IrOpcode::kWord64AtomicExchange:
+    case IrOpcode::kWord64AtomicLoad:
+    case IrOpcode::kWord64AtomicOr:
+    case IrOpcode::kWord64AtomicStore:
+    case IrOpcode::kWord64AtomicSub:
+    case IrOpcode::kWord64AtomicXor:
+    case IrOpcode::kWord64PoisonOnSpeculation:
+      return false;
+
+    case IrOpcode::kCall:
+    case IrOpcode::kCallWithCallerSavedRegisters:
+      return !(CallDescriptorOf(node->op())->flags() &
+               CallDescriptor::kNoAllocate);
+
+    case IrOpcode::kStore:
+      // Store is not safe because it could be part of CSA's bump pointer
+      // allocation(?).
+      return true;
+
+    default:
+      break;
+  }
+  return true;
+}
+
+bool CanLoopAllocate(Node* loop_effect_phi, Zone* temp_zone) {
+  Node* const control = NodeProperties::GetControlInput(loop_effect_phi);
+
+  ZoneQueue<Node*> queue(temp_zone);
+  ZoneSet<Node*> visited(temp_zone);
+  visited.insert(loop_effect_phi);
+
+  // Start the effect chain walk from the loop back edges.
+  for (int i = 1; i < control->InputCount(); ++i) {
+    queue.push(loop_effect_phi->InputAt(i));
+  }
+
+  while (!queue.empty()) {
+    Node* const current = queue.front();
+    queue.pop();
+    if (visited.find(current) == visited.end()) {
+      visited.insert(current);
+
+      if (CanAllocate(current)) return true;
+
+      for (int i = 0; i < current->op()->EffectInputCount(); ++i) {
+        queue.push(NodeProperties::GetEffectInput(current, i));
+      }
+    }
+  }
+  return false;
+}
+
+}  // namespace
 
 void MemoryOptimizer::VisitNode(Node* node, AllocationState const* state) {
   DCHECK(!node->IsDead());
   DCHECK_LT(0, node->op()->EffectInputCount());
   switch (node->opcode()) {
     case IrOpcode::kAllocate:
-      return VisitAllocate(node, state);
+      // Allocate nodes were purged from the graph in effect-control
+      // linearization.
+      UNREACHABLE();
+    case IrOpcode::kAllocateRaw:
+      return VisitAllocateRaw(node, state);
     case IrOpcode::kCall:
       return VisitCall(node, state);
+    case IrOpcode::kCallWithCallerSavedRegisters:
+      return VisitCallWithCallerSavedRegisters(node, state);
     case IrOpcode::kLoadElement:
       return VisitLoadElement(node, state);
     case IrOpcode::kLoadField:
@@ -85,207 +200,220 @@ void MemoryOptimizer::VisitNode(Node* node, AllocationState const* state) {
       return VisitStoreElement(node, state);
     case IrOpcode::kStoreField:
       return VisitStoreField(node, state);
-    case IrOpcode::kCheckedLoad:
-    case IrOpcode::kCheckedStore:
-    case IrOpcode::kIfException:
-    case IrOpcode::kLoad:
     case IrOpcode::kStore:
-      return VisitOtherEffect(node, state);
+      return VisitStore(node, state);
     default:
-      break;
+      if (!CanAllocate(node)) {
+        // These operations cannot trigger GC.
+        return VisitOtherEffect(node, state);
+      }
   }
   DCHECK_EQ(0, node->op()->EffectOutputCount());
 }
 
-void MemoryOptimizer::VisitAllocate(Node* node, AllocationState const* state) {
-  DCHECK_EQ(IrOpcode::kAllocate, node->opcode());
+#define __ gasm()->
+
+void MemoryOptimizer::VisitAllocateRaw(Node* node,
+                                       AllocationState const* state) {
+  DCHECK_EQ(IrOpcode::kAllocateRaw, node->opcode());
   Node* value;
   Node* size = node->InputAt(0);
   Node* effect = node->InputAt(1);
   Node* control = node->InputAt(2);
-  PretenureFlag pretenure = OpParameter<PretenureFlag>(node->op());
+
+  gasm()->Reset(effect, control);
+
+  AllocationType allocation = AllocationTypeOf(node->op());
+
+  // Propagate tenuring from outer allocations to inner allocations, i.e.
+  // when we allocate an object in old space and store a newly allocated
+  // child object into the pretenured object, then the newly allocated
+  // child object also should get pretenured to old space.
+  if (allocation == AllocationType::kOld) {
+    for (Edge const edge : node->use_edges()) {
+      Node* const user = edge.from();
+      if (user->opcode() == IrOpcode::kStoreField && edge.index() == 0) {
+        Node* const child = user->InputAt(1);
+        if (child->opcode() == IrOpcode::kAllocateRaw &&
+            AllocationTypeOf(child->op()) == AllocationType::kYoung) {
+          NodeProperties::ChangeOp(child, node->op());
+          break;
+        }
+      }
+    }
+  } else {
+    DCHECK_EQ(AllocationType::kYoung, allocation);
+    for (Edge const edge : node->use_edges()) {
+      Node* const user = edge.from();
+      if (user->opcode() == IrOpcode::kStoreField && edge.index() == 1) {
+        Node* const parent = user->InputAt(0);
+        if (parent->opcode() == IrOpcode::kAllocateRaw &&
+            AllocationTypeOf(parent->op()) == AllocationType::kOld) {
+          allocation = AllocationType::kOld;
+          break;
+        }
+      }
+    }
+  }
 
   // Determine the top/limit addresses.
-  Node* top_address = jsgraph()->ExternalConstant(
-      pretenure == NOT_TENURED
+  Node* top_address = __ ExternalConstant(
+      allocation == AllocationType::kYoung
           ? ExternalReference::new_space_allocation_top_address(isolate())
           : ExternalReference::old_space_allocation_top_address(isolate()));
-  Node* limit_address = jsgraph()->ExternalConstant(
-      pretenure == NOT_TENURED
+  Node* limit_address = __ ExternalConstant(
+      allocation == AllocationType::kYoung
           ? ExternalReference::new_space_allocation_limit_address(isolate())
           : ExternalReference::old_space_allocation_limit_address(isolate()));
 
   // Check if we can fold this allocation into a previous allocation represented
   // by the incoming {state}.
-  Int32Matcher m(size);
-  if (m.HasValue() && m.Value() < Page::kMaxRegularHeapObjectSize) {
-    int32_t const object_size = m.Value();
-    if (state->size() <= Page::kMaxRegularHeapObjectSize - object_size &&
-        state->group()->pretenure() == pretenure) {
+  IntPtrMatcher m(size);
+  if (m.IsInRange(0, kMaxRegularHeapObjectSize)) {
+    intptr_t const object_size = m.Value();
+    if (allocation_folding_ == AllocationFolding::kDoAllocationFolding &&
+        state->size() <= kMaxRegularHeapObjectSize - object_size &&
+        state->group()->allocation() == allocation) {
       // We can fold this Allocate {node} into the allocation {group}
       // represented by the given {state}. Compute the upper bound for
       // the new {state}.
-      int32_t const state_size = state->size() + object_size;
+      intptr_t const state_size = state->size() + object_size;
 
       // Update the reservation check to the actual maximum upper bound.
       AllocationGroup* const group = state->group();
-      if (OpParameter<int32_t>(group->size()) < state_size) {
-        NodeProperties::ChangeOp(group->size(),
-                                 common()->Int32Constant(state_size));
+      if (machine()->Is64()) {
+        if (OpParameter<int64_t>(group->size()->op()) < state_size) {
+          NodeProperties::ChangeOp(group->size(),
+                                   common()->Int64Constant(state_size));
+        }
+      } else {
+        if (OpParameter<int32_t>(group->size()->op()) < state_size) {
+          NodeProperties::ChangeOp(
+              group->size(),
+              common()->Int32Constant(static_cast<int32_t>(state_size)));
+        }
       }
 
       // Update the allocation top with the new object allocation.
       // TODO(bmeurer): Defer writing back top as much as possible.
-      Node* top = graph()->NewNode(machine()->IntAdd(), state->top(),
-                                   jsgraph()->IntPtrConstant(object_size));
-      effect = graph()->NewNode(
-          machine()->Store(StoreRepresentation(
-              MachineType::PointerRepresentation(), kNoWriteBarrier)),
-          top_address, jsgraph()->IntPtrConstant(0), top, effect, control);
+      Node* top = __ IntAdd(state->top(), size);
+      __ Store(StoreRepresentation(MachineType::PointerRepresentation(),
+                                   kNoWriteBarrier),
+               top_address, __ IntPtrConstant(0), top);
 
       // Compute the effective inner allocated address.
-      value = graph()->NewNode(
-          machine()->BitcastWordToTagged(),
-          graph()->NewNode(machine()->IntAdd(), state->top(),
-                           jsgraph()->IntPtrConstant(kHeapObjectTag)));
+      value = __ BitcastWordToTagged(
+          __ IntAdd(state->top(), __ IntPtrConstant(kHeapObjectTag)));
 
       // Extend the allocation {group}.
       group->Add(value);
       state = AllocationState::Open(group, state_size, top, zone());
     } else {
+      auto call_runtime = __ MakeDeferredLabel();
+      auto done = __ MakeLabel(MachineType::PointerRepresentation());
+
       // Setup a mutable reservation size node; will be patched as we fold
       // additional allocations into this new group.
-      Node* size = graph()->NewNode(common()->Int32Constant(object_size));
+      Node* size = __ UniqueIntPtrConstant(object_size);
 
       // Load allocation top and limit.
-      Node* top = effect =
-          graph()->NewNode(machine()->Load(MachineType::Pointer()), top_address,
-                           jsgraph()->IntPtrConstant(0), effect, control);
-      Node* limit = effect = graph()->NewNode(
-          machine()->Load(MachineType::Pointer()), limit_address,
-          jsgraph()->IntPtrConstant(0), effect, control);
+      Node* top =
+          __ Load(MachineType::Pointer(), top_address, __ IntPtrConstant(0));
+      Node* limit =
+          __ Load(MachineType::Pointer(), limit_address, __ IntPtrConstant(0));
 
       // Check if we need to collect garbage before we can start bump pointer
       // allocation (always done for folded allocations).
-      Node* check = graph()->NewNode(
-          machine()->UintLessThan(),
-          graph()->NewNode(
-              machine()->IntAdd(), top,
-              machine()->Is64()
-                  ? graph()->NewNode(machine()->ChangeInt32ToInt64(), size)
-                  : size),
-          limit);
-      Node* branch =
-          graph()->NewNode(common()->Branch(BranchHint::kTrue), check, control);
+      Node* check = __ UintLessThan(__ IntAdd(top, size), limit);
 
-      Node* if_true = graph()->NewNode(common()->IfTrue(), branch);
-      Node* etrue = effect;
-      Node* vtrue = top;
+      __ GotoIfNot(check, &call_runtime);
+      __ Goto(&done, top);
 
-      Node* if_false = graph()->NewNode(common()->IfFalse(), branch);
-      Node* efalse = effect;
-      Node* vfalse;
+      __ Bind(&call_runtime);
       {
-        Node* target = pretenure == NOT_TENURED
-                           ? jsgraph()->AllocateInNewSpaceStubConstant()
-                           : jsgraph()->AllocateInOldSpaceStubConstant();
+        Node* target = allocation == AllocationType::kYoung
+                           ? __
+                             AllocateInYoungGenerationStubConstant()
+                           : __
+                             AllocateInOldGenerationStubConstant();
         if (!allocate_operator_.is_set()) {
-          CallDescriptor* descriptor =
-              Linkage::GetAllocateCallDescriptor(graph()->zone());
-          allocate_operator_.set(common()->Call(descriptor));
+          auto descriptor = AllocateDescriptor{};
+          auto call_descriptor = Linkage::GetStubCallDescriptor(
+              graph()->zone(), descriptor, descriptor.GetStackParameterCount(),
+              CallDescriptor::kCanUseRoots, Operator::kNoThrow);
+          allocate_operator_.set(common()->Call(call_descriptor));
         }
-        vfalse = efalse = graph()->NewNode(allocate_operator_.get(), target,
-                                           size, efalse, if_false);
-        vfalse = graph()->NewNode(machine()->IntSub(), vfalse,
-                                  jsgraph()->IntPtrConstant(kHeapObjectTag));
+        Node* vfalse = __ BitcastTaggedToWord(
+            __ Call(allocate_operator_.get(), target, size));
+        vfalse = __ IntSub(vfalse, __ IntPtrConstant(kHeapObjectTag));
+        __ Goto(&done, vfalse);
       }
 
-      control = graph()->NewNode(common()->Merge(2), if_true, if_false);
-      effect = graph()->NewNode(common()->EffectPhi(2), etrue, efalse, control);
-      value = graph()->NewNode(
-          common()->Phi(MachineType::PointerRepresentation(), 2), vtrue, vfalse,
-          control);
+      __ Bind(&done);
 
       // Compute the new top and write it back.
-      top = graph()->NewNode(machine()->IntAdd(), value,
-                             jsgraph()->IntPtrConstant(object_size));
-      effect = graph()->NewNode(
-          machine()->Store(StoreRepresentation(
-              MachineType::PointerRepresentation(), kNoWriteBarrier)),
-          top_address, jsgraph()->IntPtrConstant(0), top, effect, control);
+      top = __ IntAdd(done.PhiAt(0), __ IntPtrConstant(object_size));
+      __ Store(StoreRepresentation(MachineType::PointerRepresentation(),
+                                   kNoWriteBarrier),
+               top_address, __ IntPtrConstant(0), top);
 
       // Compute the initial object address.
-      value = graph()->NewNode(
-          machine()->BitcastWordToTagged(),
-          graph()->NewNode(machine()->IntAdd(), value,
-                           jsgraph()->IntPtrConstant(kHeapObjectTag)));
+      value = __ BitcastWordToTagged(
+          __ IntAdd(done.PhiAt(0), __ IntPtrConstant(kHeapObjectTag)));
 
       // Start a new allocation group.
       AllocationGroup* group =
-          new (zone()) AllocationGroup(value, pretenure, size, zone());
+          new (zone()) AllocationGroup(value, allocation, size, zone());
       state = AllocationState::Open(group, object_size, top, zone());
     }
   } else {
+    auto call_runtime = __ MakeDeferredLabel();
+    auto done = __ MakeLabel(MachineRepresentation::kTaggedPointer);
+
     // Load allocation top and limit.
-    Node* top = effect =
-        graph()->NewNode(machine()->Load(MachineType::Pointer()), top_address,
-                         jsgraph()->IntPtrConstant(0), effect, control);
-    Node* limit = effect =
-        graph()->NewNode(machine()->Load(MachineType::Pointer()), limit_address,
-                         jsgraph()->IntPtrConstant(0), effect, control);
+    Node* top =
+        __ Load(MachineType::Pointer(), top_address, __ IntPtrConstant(0));
+    Node* limit =
+        __ Load(MachineType::Pointer(), limit_address, __ IntPtrConstant(0));
 
     // Compute the new top.
-    Node* new_top = graph()->NewNode(
-        machine()->IntAdd(), top,
-        machine()->Is64()
-            ? graph()->NewNode(machine()->ChangeInt32ToInt64(), size)
-            : size);
+    Node* new_top = __ IntAdd(top, size);
 
     // Check if we can do bump pointer allocation here.
-    Node* check = graph()->NewNode(machine()->UintLessThan(), new_top, limit);
-    Node* branch =
-        graph()->NewNode(common()->Branch(BranchHint::kTrue), check, control);
+    Node* check = __ UintLessThan(new_top, limit);
+    __ GotoIfNot(check, &call_runtime);
+    __ Store(StoreRepresentation(MachineType::PointerRepresentation(),
+                                 kNoWriteBarrier),
+             top_address, __ IntPtrConstant(0), new_top);
+    __ Goto(&done, __ BitcastWordToTagged(
+                       __ IntAdd(top, __ IntPtrConstant(kHeapObjectTag))));
 
-    Node* if_true = graph()->NewNode(common()->IfTrue(), branch);
-    Node* etrue = effect;
-    Node* vtrue;
-    {
-      etrue = graph()->NewNode(
-          machine()->Store(StoreRepresentation(
-              MachineType::PointerRepresentation(), kNoWriteBarrier)),
-          top_address, jsgraph()->IntPtrConstant(0), new_top, etrue, if_true);
-      vtrue = graph()->NewNode(
-          machine()->BitcastWordToTagged(),
-          graph()->NewNode(machine()->IntAdd(), top,
-                           jsgraph()->IntPtrConstant(kHeapObjectTag)));
+    __ Bind(&call_runtime);
+    Node* target = allocation == AllocationType::kYoung
+                       ? __
+                         AllocateInYoungGenerationStubConstant()
+                       : __
+                         AllocateInOldGenerationStubConstant();
+    if (!allocate_operator_.is_set()) {
+      auto descriptor = AllocateDescriptor{};
+      auto call_descriptor = Linkage::GetStubCallDescriptor(
+          graph()->zone(), descriptor, descriptor.GetStackParameterCount(),
+          CallDescriptor::kCanUseRoots, Operator::kNoThrow);
+      allocate_operator_.set(common()->Call(call_descriptor));
     }
+    __ Goto(&done, __ Call(allocate_operator_.get(), target, size));
 
-    Node* if_false = graph()->NewNode(common()->IfFalse(), branch);
-    Node* efalse = effect;
-    Node* vfalse;
-    {
-      Node* target = pretenure == NOT_TENURED
-                         ? jsgraph()->AllocateInNewSpaceStubConstant()
-                         : jsgraph()->AllocateInOldSpaceStubConstant();
-      if (!allocate_operator_.is_set()) {
-        CallDescriptor* descriptor =
-            Linkage::GetAllocateCallDescriptor(graph()->zone());
-        allocate_operator_.set(common()->Call(descriptor));
-      }
-      vfalse = efalse = graph()->NewNode(allocate_operator_.get(), target, size,
-                                         efalse, if_false);
-    }
-
-    control = graph()->NewNode(common()->Merge(2), if_true, if_false);
-    effect = graph()->NewNode(common()->EffectPhi(2), etrue, efalse, control);
-    value = graph()->NewNode(common()->Phi(MachineRepresentation::kTagged, 2),
-                             vtrue, vfalse, control);
+    __ Bind(&done);
+    value = done.PhiAt(0);
 
     // Create an unfoldable allocation group.
     AllocationGroup* group =
-        new (zone()) AllocationGroup(value, pretenure, zone());
+        new (zone()) AllocationGroup(value, allocation, zone());
     state = AllocationState::Closed(group, zone());
   }
+
+  effect = __ ExtractCurrentEffect();
+  control = __ ExtractCurrentControl();
 
   // Replace all effect uses of {node} with the {effect}, enqueue the
   // effect uses for further processing, and replace all value uses of
@@ -294,9 +422,11 @@ void MemoryOptimizer::VisitAllocate(Node* node, AllocationState const* state) {
     if (NodeProperties::IsEffectEdge(edge)) {
       EnqueueUse(edge.from(), edge.index(), state);
       edge.UpdateTo(effect);
-    } else {
-      DCHECK(NodeProperties::IsValueEdge(edge));
+    } else if (NodeProperties::IsValueEdge(edge)) {
       edge.UpdateTo(value);
+    } else {
+      DCHECK(NodeProperties::IsControlEdge(edge));
+      edge.UpdateTo(control);
     }
   }
 
@@ -304,8 +434,20 @@ void MemoryOptimizer::VisitAllocate(Node* node, AllocationState const* state) {
   node->Kill();
 }
 
+#undef __
+
 void MemoryOptimizer::VisitCall(Node* node, AllocationState const* state) {
   DCHECK_EQ(IrOpcode::kCall, node->opcode());
+  // If the call can allocate, we start with a fresh state.
+  if (!(CallDescriptorOf(node->op())->flags() & CallDescriptor::kNoAllocate)) {
+    state = empty_state();
+  }
+  EnqueueUses(node, state);
+}
+
+void MemoryOptimizer::VisitCallWithCallerSavedRegisters(
+    Node* node, AllocationState const* state) {
+  DCHECK_EQ(IrOpcode::kCallWithCallerSavedRegisters, node->opcode());
   // If the call can allocate, we start with a fresh state.
   if (!(CallDescriptorOf(node->op())->flags() & CallDescriptor::kNoAllocate)) {
     state = empty_state();
@@ -319,7 +461,14 @@ void MemoryOptimizer::VisitLoadElement(Node* node,
   ElementAccess const& access = ElementAccessOf(node->op());
   Node* index = node->InputAt(1);
   node->ReplaceInput(1, ComputeIndex(access, index));
-  NodeProperties::ChangeOp(node, machine()->Load(access.machine_type));
+  if (NeedsPoisoning(access.load_sensitivity) &&
+      access.machine_type.representation() !=
+          MachineRepresentation::kTaggedPointer) {
+    NodeProperties::ChangeOp(node,
+                             machine()->PoisonedLoad(access.machine_type));
+  } else {
+    NodeProperties::ChangeOp(node, machine()->Load(access.machine_type));
+  }
   EnqueueUses(node, state);
 }
 
@@ -328,7 +477,14 @@ void MemoryOptimizer::VisitLoadField(Node* node, AllocationState const* state) {
   FieldAccess const& access = FieldAccessOf(node->op());
   Node* offset = jsgraph()->IntPtrConstant(access.offset - access.tag());
   node->InsertInput(graph()->zone(), 1, offset);
-  NodeProperties::ChangeOp(node, machine()->Load(access.machine_type));
+  if (NeedsPoisoning(access.load_sensitivity) &&
+      access.machine_type.representation() !=
+          MachineRepresentation::kTaggedPointer) {
+    NodeProperties::ChangeOp(node,
+                             machine()->PoisonedLoad(access.machine_type));
+  } else {
+    NodeProperties::ChangeOp(node, machine()->Load(access.machine_type));
+  }
   EnqueueUses(node, state);
 }
 
@@ -362,29 +518,36 @@ void MemoryOptimizer::VisitStoreField(Node* node,
   EnqueueUses(node, state);
 }
 
+void MemoryOptimizer::VisitStore(Node* node, AllocationState const* state) {
+  DCHECK_EQ(IrOpcode::kStore, node->opcode());
+  StoreRepresentation representation = StoreRepresentationOf(node->op());
+  Node* object = node->InputAt(0);
+  WriteBarrierKind write_barrier_kind = ComputeWriteBarrierKind(
+      object, state, representation.write_barrier_kind());
+  if (write_barrier_kind != representation.write_barrier_kind()) {
+    NodeProperties::ChangeOp(
+        node, machine()->Store(StoreRepresentation(
+                  representation.representation(), write_barrier_kind)));
+  }
+  EnqueueUses(node, state);
+}
+
 void MemoryOptimizer::VisitOtherEffect(Node* node,
                                        AllocationState const* state) {
   EnqueueUses(node, state);
 }
 
-Node* MemoryOptimizer::ComputeIndex(ElementAccess const& access, Node* key) {
-  Node* index = key;
-  int element_size_shift =
+Node* MemoryOptimizer::ComputeIndex(ElementAccess const& access, Node* index) {
+  int const element_size_shift =
       ElementSizeLog2Of(access.machine_type.representation());
   if (element_size_shift) {
-    index = graph()->NewNode(machine()->Word32Shl(), index,
-                             jsgraph()->Int32Constant(element_size_shift));
+    index = graph()->NewNode(machine()->WordShl(), index,
+                             jsgraph()->IntPtrConstant(element_size_shift));
   }
-  const int fixed_offset = access.header_size - access.tag();
+  int const fixed_offset = access.header_size - access.tag();
   if (fixed_offset) {
-    index = graph()->NewNode(machine()->Int32Add(), index,
-                             jsgraph()->Int32Constant(fixed_offset));
-  }
-  if (machine()->Is64()) {
-    // TODO(turbofan): This is probably only correct for typed arrays, and only
-    // if the typed arrays are at most 2GiB in size, which happens to match
-    // exactly our current situation.
-    index = graph()->NewNode(machine()->ChangeUint32ToUint64(), index);
+    index = graph()->NewNode(machine()->IntAdd(), index,
+                             jsgraph()->IntPtrConstant(fixed_offset));
   }
   return index;
 }
@@ -392,7 +555,8 @@ Node* MemoryOptimizer::ComputeIndex(ElementAccess const& access, Node* key) {
 WriteBarrierKind MemoryOptimizer::ComputeWriteBarrierKind(
     Node* object, AllocationState const* state,
     WriteBarrierKind write_barrier_kind) {
-  if (state->IsNewSpaceAllocation() && state->group()->Contains(object)) {
+  if (state->IsYoungGenerationAllocation() &&
+      state->group()->Contains(object)) {
     write_barrier_kind = kNoWriteBarrier;
   }
   return write_barrier_kind;
@@ -431,8 +595,19 @@ void MemoryOptimizer::EnqueueMerge(Node* node, int index,
   DCHECK_LT(0, input_count);
   Node* const control = node->InputAt(input_count);
   if (control->opcode() == IrOpcode::kLoop) {
-    // For loops we always start with an empty state at the beginning.
-    if (index == 0) EnqueueUses(node, empty_state());
+    if (index == 0) {
+      if (CanLoopAllocate(node, zone())) {
+        // If the loop can allocate,  we start with an empty state at the
+        // beginning.
+        EnqueueUses(node, empty_state());
+      } else {
+        // If the loop cannot allocate, we can just propagate the state from
+        // before the loop.
+        EnqueueUses(node, state);
+      }
+    } else {
+      // Do not revisit backedges.
+    }
   } else {
     DCHECK_EQ(IrOpcode::kMerge, control->opcode());
     // Check if we already know about this pending merge.
@@ -487,6 +662,21 @@ CommonOperatorBuilder* MemoryOptimizer::common() const {
 
 MachineOperatorBuilder* MemoryOptimizer::machine() const {
   return jsgraph()->machine();
+}
+
+bool MemoryOptimizer::NeedsPoisoning(LoadSensitivity load_sensitivity) const {
+  // Safe loads do not need poisoning.
+  if (load_sensitivity == LoadSensitivity::kSafe) return false;
+
+  switch (poisoning_level_) {
+    case PoisoningMitigationLevel::kDontPoison:
+      return false;
+    case PoisoningMitigationLevel::kPoisonAll:
+      return true;
+    case PoisoningMitigationLevel::kPoisonCriticalOnly:
+      return load_sensitivity == LoadSensitivity::kCritical;
+  }
+  UNREACHABLE();
 }
 
 }  // namespace compiler

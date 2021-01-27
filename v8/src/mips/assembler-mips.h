@@ -41,315 +41,88 @@
 #include <set>
 
 #include "src/assembler.h"
+#include "src/external-reference.h"
+#include "src/label.h"
 #include "src/mips/constants-mips.h"
+#include "src/mips/register-mips.h"
+#include "src/objects/smi.h"
 
 namespace v8 {
 namespace internal {
 
-// clang-format off
-#define GENERAL_REGISTERS(V)                              \
-  V(zero_reg)  V(at)  V(v0)  V(v1)  V(a0)  V(a1)  V(a2)  V(a3)  \
-  V(t0)  V(t1)  V(t2)  V(t3)  V(t4)  V(t5)  V(t6)  V(t7)  \
-  V(s0)  V(s1)  V(s2)  V(s3)  V(s4)  V(s5)  V(s6)  V(s7)  V(t8)  V(t9) \
-  V(k0)  V(k1)  V(gp)  V(sp)  V(fp)  V(ra)
+class SafepointTableBuilder;
 
-#define ALLOCATABLE_GENERAL_REGISTERS(V) \
-  V(v0)  V(v1)  V(a0)  V(a1)  V(a2)  V(a3) \
-  V(t0)  V(t1)  V(t2)  V(t3)  V(t4)  V(t5)  V(t6) V(s7)
-
-#define DOUBLE_REGISTERS(V)                               \
-  V(f0)  V(f1)  V(f2)  V(f3)  V(f4)  V(f5)  V(f6)  V(f7)  \
-  V(f8)  V(f9)  V(f10) V(f11) V(f12) V(f13) V(f14) V(f15) \
-  V(f16) V(f17) V(f18) V(f19) V(f20) V(f21) V(f22) V(f23) \
-  V(f24) V(f25) V(f26) V(f27) V(f28) V(f29) V(f30) V(f31)
-
-#define FLOAT_REGISTERS DOUBLE_REGISTERS
-
-#define ALLOCATABLE_DOUBLE_REGISTERS(V)                   \
-  V(f0)  V(f2)  V(f4)  V(f6)  V(f8)  V(f10) V(f12) V(f14) \
-  V(f16) V(f18) V(f20) V(f22) V(f24) V(f26)
-// clang-format on
-
-// CPU Registers.
-//
-// 1) We would prefer to use an enum, but enum values are assignment-
-// compatible with int, which has caused code-generation bugs.
-//
-// 2) We would prefer to use a class instead of a struct but we don't like
-// the register initialization to depend on the particular initialization
-// order (which appears to be different on OS X, Linux, and Windows for the
-// installed versions of C++ we tried). Using a struct permits C-style
-// "initialization". Also, the Register objects cannot be const as this
-// forces initialization stubs in MSVC, making us dependent on initialization
-// order.
-//
-// 3) By not using an enum, we are possibly preventing the compiler from
-// doing certain constant folds, which may significantly reduce the
-// code generated for some assembly instructions (because they boil down
-// to a few constants). If this is a problem, we could change the code
-// such that we use an enum in optimized mode, and the struct in debug
-// mode. This way we get the compile-time error checking in debug mode
-// and best performance in optimized code.
-
-
-// -----------------------------------------------------------------------------
-// Implementation of Register and FPURegister.
-
-struct Register {
-  static const int kCpRegister = 23;  // cp (s7) is the 23rd register.
-
-  enum Code {
-#define REGISTER_CODE(R) kCode_##R,
-    GENERAL_REGISTERS(REGISTER_CODE)
-#undef REGISTER_CODE
-        kAfterLast,
-    kCode_no_reg = -1
-  };
-
-  static const int kNumRegisters = Code::kAfterLast;
-
-#if defined(V8_TARGET_LITTLE_ENDIAN)
-  static const int kMantissaOffset = 0;
-  static const int kExponentOffset = 4;
-#elif defined(V8_TARGET_BIG_ENDIAN)
-  static const int kMantissaOffset = 4;
-  static const int kExponentOffset = 0;
-#else
-#error Unknown endianness
-#endif
-
-
-  static Register from_code(int code) {
-    DCHECK(code >= 0);
-    DCHECK(code < kNumRegisters);
-    Register r = {code};
-    return r;
-  }
-  const char* ToString();
-  bool IsAllocatable() const;
-  bool is_valid() const { return 0 <= reg_code && reg_code < kNumRegisters; }
-  bool is(Register reg) const { return reg_code == reg.reg_code; }
-  int code() const {
-    DCHECK(is_valid());
-    return reg_code;
-  }
-  int bit() const {
-    DCHECK(is_valid());
-    return 1 << reg_code;
-  }
-
-  // Unfortunately we can't make this private in a struct.
-  int reg_code;
-};
-
-// s7: context register
-// s3: lithium scratch
-// s4: lithium scratch2
-#define DECLARE_REGISTER(R) const Register R = {Register::kCode_##R};
-GENERAL_REGISTERS(DECLARE_REGISTER)
-#undef DECLARE_REGISTER
-const Register no_reg = {Register::kCode_no_reg};
-
-
-int ToNumber(Register reg);
-
-Register ToRegister(int num);
-
-// Coprocessor register.
-struct FPURegister {
-  enum Code {
-#define REGISTER_CODE(R) kCode_##R,
-    DOUBLE_REGISTERS(REGISTER_CODE)
-#undef REGISTER_CODE
-        kAfterLast,
-    kCode_no_reg = -1
-  };
-
-  static const int kMaxNumRegisters = Code::kAfterLast;
-
-  inline static int NumRegisters();
-
-  // TODO(plind): Warning, inconsistent numbering here. kNumFPURegisters refers
-  // to number of 32-bit FPU regs, but kNumAllocatableRegisters refers to
-  // number of Double regs (64-bit regs, or FPU-reg-pairs).
-
-  const char* ToString();
-  bool IsAllocatable() const;
-  bool is_valid() const { return 0 <= reg_code && reg_code < kMaxNumRegisters; }
-  bool is(FPURegister reg) const { return reg_code == reg.reg_code; }
-  FPURegister low() const {
-    // Find low reg of a Double-reg pair, which is the reg itself.
-    DCHECK(reg_code % 2 == 0);  // Specified Double reg must be even.
-    FPURegister reg;
-    reg.reg_code = reg_code;
-    DCHECK(reg.is_valid());
-    return reg;
-  }
-  FPURegister high() const {
-    // Find high reg of a Doubel-reg pair, which is reg + 1.
-    DCHECK(reg_code % 2 == 0);  // Specified Double reg must be even.
-    FPURegister reg;
-    reg.reg_code = reg_code + 1;
-    DCHECK(reg.is_valid());
-    return reg;
-  }
-
-  int code() const {
-    DCHECK(is_valid());
-    return reg_code;
-  }
-  int bit() const {
-    DCHECK(is_valid());
-    return 1 << reg_code;
-  }
-
-  static FPURegister from_code(int code) {
-    FPURegister r = {code};
-    return r;
-  }
-  void setcode(int f) {
-    reg_code = f;
-    DCHECK(is_valid());
-  }
-  // Unfortunately we can't make this private in a struct.
-  int reg_code;
-};
-
-// A few double registers are reserved: one as a scratch register and one to
-// hold 0.0.
-//  f28: 0.0
-//  f30: scratch register.
-
-// V8 now supports the O32 ABI, and the FPU Registers are organized as 32
-// 32-bit registers, f0 through f31. When used as 'double' they are used
-// in pairs, starting with the even numbered register. So a double operation
-// on f0 really uses f0 and f1.
-// (Modern mips hardware also supports 32 64-bit registers, via setting
-// (priviledged) Status Register FR bit to 1. This is used by the N32 ABI,
-// but it is not in common use. Someday we will want to support this in v8.)
-
-// For O32 ABI, Floats and Doubles refer to same set of 32 32-bit registers.
-typedef FPURegister FloatRegister;
-
-typedef FPURegister DoubleRegister;
-
-// TODO(mips) Define SIMD registers.
-typedef FPURegister Simd128Register;
-
-const DoubleRegister no_freg = {-1};
-
-const DoubleRegister f0 = {0};  // Return value in hard float mode.
-const DoubleRegister f1 = {1};
-const DoubleRegister f2 = {2};
-const DoubleRegister f3 = {3};
-const DoubleRegister f4 = {4};
-const DoubleRegister f5 = {5};
-const DoubleRegister f6 = {6};
-const DoubleRegister f7 = {7};
-const DoubleRegister f8 = {8};
-const DoubleRegister f9 = {9};
-const DoubleRegister f10 = {10};
-const DoubleRegister f11 = {11};
-const DoubleRegister f12 = {12};  // Arg 0 in hard float mode.
-const DoubleRegister f13 = {13};
-const DoubleRegister f14 = {14};  // Arg 1 in hard float mode.
-const DoubleRegister f15 = {15};
-const DoubleRegister f16 = {16};
-const DoubleRegister f17 = {17};
-const DoubleRegister f18 = {18};
-const DoubleRegister f19 = {19};
-const DoubleRegister f20 = {20};
-const DoubleRegister f21 = {21};
-const DoubleRegister f22 = {22};
-const DoubleRegister f23 = {23};
-const DoubleRegister f24 = {24};
-const DoubleRegister f25 = {25};
-const DoubleRegister f26 = {26};
-const DoubleRegister f27 = {27};
-const DoubleRegister f28 = {28};
-const DoubleRegister f29 = {29};
-const DoubleRegister f30 = {30};
-const DoubleRegister f31 = {31};
-
-// Register aliases.
-// cp is assumed to be a callee saved register.
-// Defined using #define instead of "static const Register&" because Clang
-// complains otherwise when a compilation unit that includes this header
-// doesn't use the variables.
-#define kRootRegister s6
-#define cp s7
-#define kLithiumScratchReg s3
-#define kLithiumScratchReg2 s4
-#define kLithiumScratchDouble f30
-#define kDoubleRegZero f28
-// Used on mips32r6 for compare operations.
-// We use the last non-callee saved odd register for O32 ABI
-#define kDoubleCompareReg f19
-
-// FPU (coprocessor 1) control registers.
-// Currently only FCSR (#31) is implemented.
-struct FPUControlRegister {
-  bool is_valid() const { return reg_code == kFCSRRegister; }
-  bool is(FPUControlRegister creg) const { return reg_code == creg.reg_code; }
-  int code() const {
-    DCHECK(is_valid());
-    return reg_code;
-  }
-  int bit() const {
-    DCHECK(is_valid());
-    return 1 << reg_code;
-  }
-  void setcode(int f) {
-    reg_code = f;
-    DCHECK(is_valid());
-  }
-  // Unfortunately we can't make this private in a struct.
-  int reg_code;
-};
-
-const FPUControlRegister no_fpucreg = { kInvalidFPUControlRegister };
-const FPUControlRegister FCSR = { kFCSRRegister };
+// Allow programmer to use Branch Delay Slot of Branches, Jumps, Calls.
+enum BranchDelaySlot { USE_DELAY_SLOT, PROTECT };
 
 // -----------------------------------------------------------------------------
 // Machine instruction Operands.
 
 // Class Operand represents a shifter operand in data processing instructions.
-class Operand BASE_EMBEDDED {
+class Operand {
  public:
   // Immediate.
-  INLINE(explicit Operand(int32_t immediate,
-         RelocInfo::Mode rmode = RelocInfo::NONE32));
-  INLINE(explicit Operand(const ExternalReference& f));
-  INLINE(explicit Operand(const char* s));
-  INLINE(explicit Operand(Object** opp));
-  INLINE(explicit Operand(Context** cpp));
-  explicit Operand(Handle<Object> handle);
-  INLINE(explicit Operand(Smi* value));
+  V8_INLINE explicit Operand(int32_t immediate,
+                             RelocInfo::Mode rmode = RelocInfo::NONE)
+      : rm_(no_reg), rmode_(rmode) {
+    value_.immediate = immediate;
+  }
+  V8_INLINE explicit Operand(const ExternalReference& f)
+      : rm_(no_reg), rmode_(RelocInfo::EXTERNAL_REFERENCE) {
+    value_.immediate = static_cast<int32_t>(f.address());
+  }
+  V8_INLINE explicit Operand(const char* s);
+  explicit Operand(Handle<HeapObject> handle);
+  V8_INLINE explicit Operand(Smi value) : rm_(no_reg), rmode_(RelocInfo::NONE) {
+    value_.immediate = static_cast<intptr_t>(value.ptr());
+  }
+
+  static Operand EmbeddedNumber(double number);  // Smi or HeapNumber.
+  static Operand EmbeddedStringConstant(const StringConstantBase* str);
 
   // Register.
-  INLINE(explicit Operand(Register rm));
+  V8_INLINE explicit Operand(Register rm) : rm_(rm) {}
 
   // Return true if this is a register operand.
-  INLINE(bool is_reg() const);
+  V8_INLINE bool is_reg() const;
 
-  inline int32_t immediate() const {
-    DCHECK(!is_reg());
-    return imm32_;
+  inline int32_t immediate() const;
+
+  bool IsImmediate() const { return !rm_.is_valid(); }
+
+  HeapObjectRequest heap_object_request() const {
+    DCHECK(IsHeapObjectRequest());
+    return value_.heap_object_request;
+  }
+
+  bool IsHeapObjectRequest() const {
+    DCHECK_IMPLIES(is_heap_object_request_, IsImmediate());
+    DCHECK_IMPLIES(is_heap_object_request_,
+                   rmode_ == RelocInfo::EMBEDDED_OBJECT ||
+                       rmode_ == RelocInfo::CODE_TARGET);
+    return is_heap_object_request_;
   }
 
   Register rm() const { return rm_; }
 
+  RelocInfo::Mode rmode() const { return rmode_; }
+
  private:
   Register rm_;
-  int32_t imm32_;  // Valid if rm_ == no_reg.
+  union Value {
+    Value() {}
+    HeapObjectRequest heap_object_request;  // if is_heap_object_request_
+    int32_t immediate;                      // otherwise
+  } value_;                                 // valid if rm_ == no_reg
+  bool is_heap_object_request_ = false;
   RelocInfo::Mode rmode_;
 
   friend class Assembler;
-  friend class MacroAssembler;
+  // friend class MacroAssembler;
 };
 
 
-// On MIPS we have only one adressing mode with base_reg + offset.
+// On MIPS we have only one addressing mode with base_reg + offset.
 // Class MemOperand represents a memory operand in load and store instructions.
 class MemOperand : public Operand {
  public:
@@ -374,29 +147,34 @@ class MemOperand : public Operand {
   friend class Assembler;
 };
 
-
-class Assembler : public AssemblerBase {
+class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
  public:
   // Create an assembler. Instructions and relocation information are emitted
   // into a buffer, with the instructions starting from the beginning and the
   // relocation information starting from the end of the buffer. See CodeDesc
   // for a detailed comment on the layout (globals.h).
   //
-  // If the provided buffer is NULL, the assembler allocates and grows its own
-  // buffer, and buffer_size determines the initial buffer size. The buffer is
-  // owned by the assembler and deallocated upon destruction of the assembler.
-  //
-  // If the provided buffer is not NULL, the assembler uses the provided buffer
-  // for code generation and assumes its size to be buffer_size. If the buffer
-  // is too small, a fatal error occurs. No deallocation of the buffer is done
-  // upon destruction of the assembler.
-  Assembler(Isolate* isolate, void* buffer, int buffer_size);
+  // If the provided buffer is nullptr, the assembler allocates and grows its
+  // own buffer. Otherwise it takes ownership of the provided buffer.
+  explicit Assembler(const AssemblerOptions&,
+                     std::unique_ptr<AssemblerBuffer> = {});
+
   virtual ~Assembler() { }
 
-  // GetCode emits any pending (non-emitted) code and fills the descriptor
-  // desc. GetCode() is idempotent; it returns the same result if no other
-  // Assembler functions are invoked in between GetCode() calls.
-  void GetCode(CodeDesc* desc);
+  // GetCode emits any pending (non-emitted) code and fills the descriptor desc.
+  static constexpr int kNoHandlerTable = 0;
+  static constexpr SafepointTableBuilder* kNoSafepointTable = nullptr;
+  void GetCode(Isolate* isolate, CodeDesc* desc,
+               SafepointTableBuilder* safepoint_table_builder,
+               int handler_table_offset);
+
+  // Convenience wrapper for code without safepoint or handler tables.
+  void GetCode(Isolate* isolate, CodeDesc* desc) {
+    GetCode(isolate, desc, kNoSafepointTable, kNoHandlerTable);
+  }
+
+  // Unused on this architecture.
+  void MaybeEmitOutOfLineConstantPool() {}
 
   // Label operations & relative jumps (PPUM Appendix D).
   //
@@ -455,65 +233,75 @@ class Assembler : public AssemblerBase {
     return branch_offset26(L) >> 2;
   }
   uint32_t jump_address(Label* L);
+  uint32_t branch_long_offset(Label* L);
 
   // Puts a labels target address at the given position.
   // The high 8 bits are set to zero.
   void label_at_put(Label* L, int at_offset);
 
   // Read/Modify the code target address in the branch/call instruction at pc.
+  // The isolate argument is unused (and may be nullptr) when skipping flushing.
   static Address target_address_at(Address pc);
-  static void set_target_address_at(
-      Isolate* isolate, Address pc, Address target,
-      ICacheFlushMode icache_flush_mode = FLUSH_ICACHE_IF_NEEDED);
+  V8_INLINE static void set_target_address_at(
+      Address pc, Address target,
+      ICacheFlushMode icache_flush_mode = FLUSH_ICACHE_IF_NEEDED) {
+    set_target_value_at(pc, static_cast<uint32_t>(target), icache_flush_mode);
+  }
   // On MIPS there is no Constant Pool so we skip that parameter.
-  INLINE(static Address target_address_at(Address pc, Address constant_pool)) {
+  V8_INLINE static Address target_address_at(Address pc,
+                                             Address constant_pool) {
     return target_address_at(pc);
   }
-  INLINE(static void set_target_address_at(
-      Isolate* isolate, Address pc, Address constant_pool, Address target,
-      ICacheFlushMode icache_flush_mode = FLUSH_ICACHE_IF_NEEDED)) {
-    set_target_address_at(isolate, pc, target, icache_flush_mode);
+  V8_INLINE static void set_target_address_at(
+      Address pc, Address constant_pool, Address target,
+      ICacheFlushMode icache_flush_mode = FLUSH_ICACHE_IF_NEEDED) {
+    set_target_address_at(pc, target, icache_flush_mode);
   }
-  INLINE(static Address target_address_at(Address pc, Code* code)) {
-    Address constant_pool = code ? code->constant_pool() : NULL;
-    return target_address_at(pc, constant_pool);
-  }
-  INLINE(static void set_target_address_at(
-      Isolate* isolate, Address pc, Code* code, Address target,
-      ICacheFlushMode icache_flush_mode = FLUSH_ICACHE_IF_NEEDED)) {
-    Address constant_pool = code ? code->constant_pool() : NULL;
-    set_target_address_at(isolate, pc, constant_pool, target,
-                          icache_flush_mode);
-  }
+
+  static void set_target_value_at(
+      Address pc, uint32_t target,
+      ICacheFlushMode icache_flush_mode = FLUSH_ICACHE_IF_NEEDED);
 
   // Return the code target address at a call site from the return address
   // of that call in the instruction stream.
   inline static Address target_address_from_return_address(Address pc);
 
-  static void QuietNaN(HeapObject* nan);
-
   // This sets the branch destination (which gets loaded at the call address).
   // This is for calls and branches within generated code.  The serializer
   // has already deserialized the lui/ori instructions etc.
   inline static void deserialization_set_special_target_at(
-      Isolate* isolate, Address instruction_payload, Code* code,
-      Address target) {
-    set_target_address_at(
-        isolate,
-        instruction_payload - kInstructionsFor32BitConstant * kInstrSize, code,
-        target);
-  }
+      Address instruction_payload, Code code, Address target);
+
+  // Get the size of the special target encoded at 'instruction_payload'.
+  inline static int deserialization_special_target_size(
+      Address instruction_payload);
 
   // This sets the internal reference at the pc.
   inline static void deserialization_set_target_internal_reference_at(
-      Isolate* isolate, Address pc, Address target,
+      Address pc, Address target,
       RelocInfo::Mode mode = RelocInfo::INTERNAL_REFERENCE);
 
-  // Size of an instruction.
-  static const int kInstrSize = sizeof(Instr);
-
   // Difference between address of current opcode and target address offset.
-  static const int kBranchPCOffset = 4;
+  static constexpr int kBranchPCOffset = kInstrSize;
+
+  // Difference between address of current opcode and target address offset,
+  // when we are generatinga sequence of instructions for long relative PC
+  // branches. It is distance between address of the first instruction in
+  // the jump sequence, and the value that ra gets after calling nal().
+  static constexpr int kLongBranchPCOffset = 3 * kInstrSize;
+
+  // Adjust ra register in branch delay slot of bal instruction in order to skip
+  // instructions not needed after optimization of PIC in
+  // TurboAssembler::BranchAndLink method.
+  static constexpr int kOptimizedBranchAndLinkLongReturnOffset = 3 * kInstrSize;
+
+  // Offset of target relative address in calls/jumps for builtins. It is
+  // distance between instruction that is placed just after calling
+  // RecordRelocInfo, and the value that ra gets aftr calling nal().
+  static constexpr int kRelativeJumpForBuiltinsOffset = 1 * kInstrSize;
+  // Relative target address of jumps for builtins when we use lui, ori, dsll,
+  // ori sequence when loading address that cannot fit into 32 bits.
+  static constexpr int kRelativeCallForBuiltinsOffset = 3 * kInstrSize;
 
   // Here we are patching the address in the LUI/ORI instruction pair.
   // These values are used in the serialization process and must be zero for
@@ -521,38 +309,33 @@ class Assembler : public AssemblerBase {
   // are split across two consecutive instructions and don't exist separately
   // in the code, so the serializer should not step forwards in memory after
   // a target is resolved and written.
-  static const int kSpecialTargetSize = 0;
+
+  static constexpr int kSpecialTargetSize = 0;
 
   // Number of consecutive instructions used to store 32bit constant. This
   // constant is used in RelocInfo::target_address_address() function to tell
   // serializer address of the instruction that follows LUI/ORI instruction
   // pair.
-  static const int kInstructionsFor32BitConstant = 2;
+  static constexpr int kInstructionsFor32BitConstant = 2;
 
   // Distance between the instruction referring to the address of the call
   // target and the return address.
 #ifdef _MIPS_ARCH_MIPS32R6
-  static const int kCallTargetAddressOffset = 3 * kInstrSize;
+  static constexpr int kCallTargetAddressOffset = 2 * kInstrSize;
 #else
-  static const int kCallTargetAddressOffset = 4 * kInstrSize;
+  static constexpr int kCallTargetAddressOffset = 4 * kInstrSize;
 #endif
 
-  // Distance between start of patched debug break slot and the emitted address
-  // to jump to.
-  static const int kPatchDebugBreakSlotAddressOffset = 4 * kInstrSize;
+  // Max offset for instructions with 16-bit offset field
+  static constexpr int kMaxBranchOffset = (1 << (18 - 1)) - 1;
 
-  // Difference between address of current opcode and value read from pc
-  // register.
-  static const int kPcLoadDelta = 4;
+  // Max offset for compact branch instructions with 26-bit offset field
+  static constexpr int kMaxCompactBranchOffset = (1 << (28 - 1)) - 1;
 
-#ifdef _MIPS_ARCH_MIPS32R6
-  static const int kDebugBreakSlotInstructions = 3;
-#else
-  static const int kDebugBreakSlotInstructions = 4;
-#endif
-  static const int kDebugBreakSlotLength =
-      kDebugBreakSlotInstructions * kInstrSize;
+  static constexpr int kTrampolineSlotsSize =
+      IsMipsArchVariant(kMips32r6) ? 2 * kInstrSize : 7 * kInstrSize;
 
+  RegList* GetScratchRegisterList() { return &scratch_register_list_; }
 
   // ---------------------------------------------------------------------------
   // Code generation.
@@ -579,16 +362,13 @@ class Assembler : public AssemblerBase {
     // Helper values.
     LAST_CODE_MARKER,
     FIRST_IC_MARKER = PROPERTY_ACCESS_INLINED,
-    // Code aging
-    CODE_AGE_MARKER_NOP = 6,
-    CODE_AGE_SEQUENCE_NOP
   };
 
   // Type == 0 is the default non-marking nop. For mips this is a
   // sll(zero_reg, zero_reg, 0). We use rt_reg == at for non-zero
   // marking, to avoid conflict with ssnop and ehb instructions.
   void nop(unsigned int type = 0) {
-    DCHECK(type < 32);
+    DCHECK_LT(type, 32);
     Register nop_rt_reg = (type == 0) ? zero_reg : at;
     sll(zero_reg, nop_rt_reg, type, true);
   }
@@ -655,6 +435,7 @@ class Assembler : public AssemblerBase {
     bltc(rs, rt, shifted_branch_offset(L));
   }
   void bltzal(Register rs, int16_t offset);
+  void nal() { bltzal(zero_reg, 0); }
   void blezalc(Register rt, int16_t offset);
   inline void blezalc(Register rt, Label* L) {
     blezalc(rt, shifted_branch_offset(L));
@@ -776,6 +557,12 @@ class Assembler : public AssemblerBase {
   void swl(Register rd, const MemOperand& rs);
   void swr(Register rd, const MemOperand& rs);
 
+  // ----------Atomic instructions--------------
+
+  void ll(Register rd, const MemOperand& rs);
+  void sc(Register rd, const MemOperand& rs);
+  void llx(Register rd, const MemOperand& rs);
+  void scx(Register rd, const MemOperand& rs);
 
   // ---------PC-Relative-instructions-----------
 
@@ -850,14 +637,15 @@ class Assembler : public AssemblerBase {
   void bitswap(Register rd, Register rt);
   void align(Register rd, Register rs, Register rt, uint8_t bp);
 
+  void wsbh(Register rd, Register rt);
+  void seh(Register rd, Register rt);
+  void seb(Register rd, Register rt);
+
   // --------Coprocessor-instructions----------------
 
   // Load, store, and move.
   void lwc1(FPURegister fd, const MemOperand& src);
-  void ldc1(FPURegister fd, const MemOperand& src);
-
   void swc1(FPURegister fs, const MemOperand& dst);
-  void sdc1(FPURegister fs, const MemOperand& dst);
 
   void mtc1(Register rt, FPURegister fs);
   void mthc1(Register rt, FPURegister fs);
@@ -875,7 +663,14 @@ class Assembler : public AssemblerBase {
   void sub_d(FPURegister fd, FPURegister fs, FPURegister ft);
   void mul_s(FPURegister fd, FPURegister fs, FPURegister ft);
   void mul_d(FPURegister fd, FPURegister fs, FPURegister ft);
+  void madd_s(FPURegister fd, FPURegister fr, FPURegister fs, FPURegister ft);
   void madd_d(FPURegister fd, FPURegister fr, FPURegister fs, FPURegister ft);
+  void msub_s(FPURegister fd, FPURegister fr, FPURegister fs, FPURegister ft);
+  void msub_d(FPURegister fd, FPURegister fr, FPURegister fs, FPURegister ft);
+  void maddf_s(FPURegister fd, FPURegister fs, FPURegister ft);
+  void maddf_d(FPURegister fd, FPURegister fs, FPURegister ft);
+  void msubf_s(FPURegister fd, FPURegister fs, FPURegister ft);
+  void msubf_d(FPURegister fd, FPURegister fs, FPURegister ft);
   void div_s(FPURegister fd, FPURegister fs, FPURegister ft);
   void div_d(FPURegister fd, FPURegister fs, FPURegister ft);
   void abs_s(FPURegister fd, FPURegister fs);
@@ -972,6 +767,593 @@ class Assembler : public AssemblerBase {
   }
   void fcmp(FPURegister src1, const double src2, FPUCondition cond);
 
+  // MSA instructions
+  void bz_v(MSARegister wt, int16_t offset);
+  inline void bz_v(MSARegister wt, Label* L) {
+    bz_v(wt, shifted_branch_offset(L));
+  }
+  void bz_b(MSARegister wt, int16_t offset);
+  inline void bz_b(MSARegister wt, Label* L) {
+    bz_b(wt, shifted_branch_offset(L));
+  }
+  void bz_h(MSARegister wt, int16_t offset);
+  inline void bz_h(MSARegister wt, Label* L) {
+    bz_h(wt, shifted_branch_offset(L));
+  }
+  void bz_w(MSARegister wt, int16_t offset);
+  inline void bz_w(MSARegister wt, Label* L) {
+    bz_w(wt, shifted_branch_offset(L));
+  }
+  void bz_d(MSARegister wt, int16_t offset);
+  inline void bz_d(MSARegister wt, Label* L) {
+    bz_d(wt, shifted_branch_offset(L));
+  }
+  void bnz_v(MSARegister wt, int16_t offset);
+  inline void bnz_v(MSARegister wt, Label* L) {
+    bnz_v(wt, shifted_branch_offset(L));
+  }
+  void bnz_b(MSARegister wt, int16_t offset);
+  inline void bnz_b(MSARegister wt, Label* L) {
+    bnz_b(wt, shifted_branch_offset(L));
+  }
+  void bnz_h(MSARegister wt, int16_t offset);
+  inline void bnz_h(MSARegister wt, Label* L) {
+    bnz_h(wt, shifted_branch_offset(L));
+  }
+  void bnz_w(MSARegister wt, int16_t offset);
+  inline void bnz_w(MSARegister wt, Label* L) {
+    bnz_w(wt, shifted_branch_offset(L));
+  }
+  void bnz_d(MSARegister wt, int16_t offset);
+  inline void bnz_d(MSARegister wt, Label* L) {
+    bnz_d(wt, shifted_branch_offset(L));
+  }
+
+  void ld_b(MSARegister wd, const MemOperand& rs);
+  void ld_h(MSARegister wd, const MemOperand& rs);
+  void ld_w(MSARegister wd, const MemOperand& rs);
+  void ld_d(MSARegister wd, const MemOperand& rs);
+  void st_b(MSARegister wd, const MemOperand& rs);
+  void st_h(MSARegister wd, const MemOperand& rs);
+  void st_w(MSARegister wd, const MemOperand& rs);
+  void st_d(MSARegister wd, const MemOperand& rs);
+
+  void ldi_b(MSARegister wd, int32_t imm10);
+  void ldi_h(MSARegister wd, int32_t imm10);
+  void ldi_w(MSARegister wd, int32_t imm10);
+  void ldi_d(MSARegister wd, int32_t imm10);
+
+  void addvi_b(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void addvi_h(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void addvi_w(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void addvi_d(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void subvi_b(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void subvi_h(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void subvi_w(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void subvi_d(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void maxi_s_b(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void maxi_s_h(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void maxi_s_w(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void maxi_s_d(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void maxi_u_b(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void maxi_u_h(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void maxi_u_w(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void maxi_u_d(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void mini_s_b(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void mini_s_h(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void mini_s_w(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void mini_s_d(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void mini_u_b(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void mini_u_h(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void mini_u_w(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void mini_u_d(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void ceqi_b(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void ceqi_h(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void ceqi_w(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void ceqi_d(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void clti_s_b(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void clti_s_h(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void clti_s_w(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void clti_s_d(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void clti_u_b(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void clti_u_h(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void clti_u_w(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void clti_u_d(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void clei_s_b(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void clei_s_h(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void clei_s_w(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void clei_s_d(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void clei_u_b(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void clei_u_h(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void clei_u_w(MSARegister wd, MSARegister ws, uint32_t imm5);
+  void clei_u_d(MSARegister wd, MSARegister ws, uint32_t imm5);
+
+  void andi_b(MSARegister wd, MSARegister ws, uint32_t imm8);
+  void ori_b(MSARegister wd, MSARegister ws, uint32_t imm8);
+  void nori_b(MSARegister wd, MSARegister ws, uint32_t imm8);
+  void xori_b(MSARegister wd, MSARegister ws, uint32_t imm8);
+  void bmnzi_b(MSARegister wd, MSARegister ws, uint32_t imm8);
+  void bmzi_b(MSARegister wd, MSARegister ws, uint32_t imm8);
+  void bseli_b(MSARegister wd, MSARegister ws, uint32_t imm8);
+  void shf_b(MSARegister wd, MSARegister ws, uint32_t imm8);
+  void shf_h(MSARegister wd, MSARegister ws, uint32_t imm8);
+  void shf_w(MSARegister wd, MSARegister ws, uint32_t imm8);
+
+  void and_v(MSARegister wd, MSARegister ws, MSARegister wt);
+  void or_v(MSARegister wd, MSARegister ws, MSARegister wt);
+  void nor_v(MSARegister wd, MSARegister ws, MSARegister wt);
+  void xor_v(MSARegister wd, MSARegister ws, MSARegister wt);
+  void bmnz_v(MSARegister wd, MSARegister ws, MSARegister wt);
+  void bmz_v(MSARegister wd, MSARegister ws, MSARegister wt);
+  void bsel_v(MSARegister wd, MSARegister ws, MSARegister wt);
+
+  void fill_b(MSARegister wd, Register rs);
+  void fill_h(MSARegister wd, Register rs);
+  void fill_w(MSARegister wd, Register rs);
+  void pcnt_b(MSARegister wd, MSARegister ws);
+  void pcnt_h(MSARegister wd, MSARegister ws);
+  void pcnt_w(MSARegister wd, MSARegister ws);
+  void pcnt_d(MSARegister wd, MSARegister ws);
+  void nloc_b(MSARegister wd, MSARegister ws);
+  void nloc_h(MSARegister wd, MSARegister ws);
+  void nloc_w(MSARegister wd, MSARegister ws);
+  void nloc_d(MSARegister wd, MSARegister ws);
+  void nlzc_b(MSARegister wd, MSARegister ws);
+  void nlzc_h(MSARegister wd, MSARegister ws);
+  void nlzc_w(MSARegister wd, MSARegister ws);
+  void nlzc_d(MSARegister wd, MSARegister ws);
+
+  void fclass_w(MSARegister wd, MSARegister ws);
+  void fclass_d(MSARegister wd, MSARegister ws);
+  void ftrunc_s_w(MSARegister wd, MSARegister ws);
+  void ftrunc_s_d(MSARegister wd, MSARegister ws);
+  void ftrunc_u_w(MSARegister wd, MSARegister ws);
+  void ftrunc_u_d(MSARegister wd, MSARegister ws);
+  void fsqrt_w(MSARegister wd, MSARegister ws);
+  void fsqrt_d(MSARegister wd, MSARegister ws);
+  void frsqrt_w(MSARegister wd, MSARegister ws);
+  void frsqrt_d(MSARegister wd, MSARegister ws);
+  void frcp_w(MSARegister wd, MSARegister ws);
+  void frcp_d(MSARegister wd, MSARegister ws);
+  void frint_w(MSARegister wd, MSARegister ws);
+  void frint_d(MSARegister wd, MSARegister ws);
+  void flog2_w(MSARegister wd, MSARegister ws);
+  void flog2_d(MSARegister wd, MSARegister ws);
+  void fexupl_w(MSARegister wd, MSARegister ws);
+  void fexupl_d(MSARegister wd, MSARegister ws);
+  void fexupr_w(MSARegister wd, MSARegister ws);
+  void fexupr_d(MSARegister wd, MSARegister ws);
+  void ffql_w(MSARegister wd, MSARegister ws);
+  void ffql_d(MSARegister wd, MSARegister ws);
+  void ffqr_w(MSARegister wd, MSARegister ws);
+  void ffqr_d(MSARegister wd, MSARegister ws);
+  void ftint_s_w(MSARegister wd, MSARegister ws);
+  void ftint_s_d(MSARegister wd, MSARegister ws);
+  void ftint_u_w(MSARegister wd, MSARegister ws);
+  void ftint_u_d(MSARegister wd, MSARegister ws);
+  void ffint_s_w(MSARegister wd, MSARegister ws);
+  void ffint_s_d(MSARegister wd, MSARegister ws);
+  void ffint_u_w(MSARegister wd, MSARegister ws);
+  void ffint_u_d(MSARegister wd, MSARegister ws);
+
+  void sll_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void sll_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void sll_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void sll_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void sra_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void sra_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void sra_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void sra_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void srl_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void srl_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void srl_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void srl_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void bclr_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void bclr_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void bclr_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void bclr_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void bset_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void bset_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void bset_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void bset_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void bneg_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void bneg_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void bneg_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void bneg_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void binsl_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void binsl_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void binsl_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void binsl_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void binsr_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void binsr_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void binsr_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void binsr_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void addv_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void addv_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void addv_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void addv_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subv_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subv_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subv_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subv_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void max_s_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void max_s_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void max_s_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void max_s_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void max_u_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void max_u_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void max_u_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void max_u_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void min_s_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void min_s_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void min_s_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void min_s_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void min_u_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void min_u_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void min_u_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void min_u_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void max_a_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void max_a_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void max_a_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void max_a_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void min_a_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void min_a_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void min_a_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void min_a_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ceq_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ceq_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ceq_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ceq_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void clt_s_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void clt_s_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void clt_s_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void clt_s_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void clt_u_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void clt_u_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void clt_u_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void clt_u_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void cle_s_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void cle_s_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void cle_s_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void cle_s_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void cle_u_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void cle_u_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void cle_u_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void cle_u_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void add_a_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void add_a_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void add_a_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void add_a_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void adds_a_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void adds_a_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void adds_a_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void adds_a_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void adds_s_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void adds_s_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void adds_s_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void adds_s_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void adds_u_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void adds_u_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void adds_u_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void adds_u_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ave_s_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ave_s_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ave_s_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ave_s_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ave_u_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ave_u_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ave_u_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ave_u_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void aver_s_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void aver_s_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void aver_s_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void aver_s_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void aver_u_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void aver_u_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void aver_u_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void aver_u_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subs_s_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subs_s_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subs_s_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subs_s_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subs_u_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subs_u_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subs_u_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subs_u_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subsus_u_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subsus_u_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subsus_u_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subsus_u_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subsus_s_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subsus_s_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subsus_s_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subsus_s_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subsuu_u_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subsuu_u_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subsuu_u_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subsuu_u_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subsuu_s_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subsuu_s_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subsuu_s_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void subsuu_s_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void asub_s_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void asub_s_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void asub_s_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void asub_s_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void asub_u_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void asub_u_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void asub_u_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void asub_u_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void mulv_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void mulv_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void mulv_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void mulv_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void maddv_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void maddv_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void maddv_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void maddv_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void msubv_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void msubv_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void msubv_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void msubv_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void div_s_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void div_s_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void div_s_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void div_s_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void div_u_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void div_u_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void div_u_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void div_u_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void mod_s_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void mod_s_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void mod_s_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void mod_s_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void mod_u_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void mod_u_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void mod_u_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void mod_u_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dotp_s_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dotp_s_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dotp_s_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dotp_s_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dotp_u_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dotp_u_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dotp_u_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dotp_u_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dpadd_s_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dpadd_s_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dpadd_s_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dpadd_s_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dpadd_u_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dpadd_u_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dpadd_u_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dpadd_u_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dpsub_s_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dpsub_s_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dpsub_s_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dpsub_s_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dpsub_u_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dpsub_u_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dpsub_u_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void dpsub_u_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void sld_b(MSARegister wd, MSARegister ws, Register rt);
+  void sld_h(MSARegister wd, MSARegister ws, Register rt);
+  void sld_w(MSARegister wd, MSARegister ws, Register rt);
+  void sld_d(MSARegister wd, MSARegister ws, Register rt);
+  void splat_b(MSARegister wd, MSARegister ws, Register rt);
+  void splat_h(MSARegister wd, MSARegister ws, Register rt);
+  void splat_w(MSARegister wd, MSARegister ws, Register rt);
+  void splat_d(MSARegister wd, MSARegister ws, Register rt);
+  void pckev_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void pckev_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void pckev_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void pckev_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void pckod_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void pckod_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void pckod_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void pckod_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ilvl_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ilvl_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ilvl_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ilvl_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ilvr_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ilvr_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ilvr_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ilvr_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ilvev_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ilvev_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ilvev_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ilvev_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ilvod_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ilvod_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ilvod_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ilvod_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void vshf_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void vshf_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void vshf_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void vshf_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void srar_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void srar_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void srar_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void srar_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void srlr_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void srlr_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void srlr_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void srlr_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void hadd_s_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void hadd_s_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void hadd_s_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void hadd_s_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void hadd_u_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void hadd_u_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void hadd_u_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void hadd_u_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void hsub_s_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void hsub_s_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void hsub_s_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void hsub_s_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void hsub_u_b(MSARegister wd, MSARegister ws, MSARegister wt);
+  void hsub_u_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void hsub_u_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void hsub_u_d(MSARegister wd, MSARegister ws, MSARegister wt);
+
+  void fcaf_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fcaf_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fcun_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fcun_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fceq_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fceq_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fcueq_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fcueq_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fclt_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fclt_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fcult_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fcult_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fcle_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fcle_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fcule_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fcule_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fsaf_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fsaf_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fsun_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fsun_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fseq_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fseq_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fsueq_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fsueq_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fslt_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fslt_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fsult_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fsult_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fsle_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fsle_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fsule_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fsule_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fadd_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fadd_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fsub_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fsub_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fmul_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fmul_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fdiv_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fdiv_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fmadd_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fmadd_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fmsub_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fmsub_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fexp2_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fexp2_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fexdo_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fexdo_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ftq_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void ftq_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fmin_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fmin_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fmin_a_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fmin_a_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fmax_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fmax_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fmax_a_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fmax_a_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fcor_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fcor_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fcune_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fcune_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fcne_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fcne_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void mul_q_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void mul_q_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void madd_q_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void madd_q_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void msub_q_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void msub_q_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fsor_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fsor_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fsune_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fsune_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fsne_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void fsne_d(MSARegister wd, MSARegister ws, MSARegister wt);
+  void mulr_q_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void mulr_q_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void maddr_q_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void maddr_q_w(MSARegister wd, MSARegister ws, MSARegister wt);
+  void msubr_q_h(MSARegister wd, MSARegister ws, MSARegister wt);
+  void msubr_q_w(MSARegister wd, MSARegister ws, MSARegister wt);
+
+  void sldi_b(MSARegister wd, MSARegister ws, uint32_t n);
+  void sldi_h(MSARegister wd, MSARegister ws, uint32_t n);
+  void sldi_w(MSARegister wd, MSARegister ws, uint32_t n);
+  void sldi_d(MSARegister wd, MSARegister ws, uint32_t n);
+  void splati_b(MSARegister wd, MSARegister ws, uint32_t n);
+  void splati_h(MSARegister wd, MSARegister ws, uint32_t n);
+  void splati_w(MSARegister wd, MSARegister ws, uint32_t n);
+  void splati_d(MSARegister wd, MSARegister ws, uint32_t n);
+  void copy_s_b(Register rd, MSARegister ws, uint32_t n);
+  void copy_s_h(Register rd, MSARegister ws, uint32_t n);
+  void copy_s_w(Register rd, MSARegister ws, uint32_t n);
+  void copy_u_b(Register rd, MSARegister ws, uint32_t n);
+  void copy_u_h(Register rd, MSARegister ws, uint32_t n);
+  void copy_u_w(Register rd, MSARegister ws, uint32_t n);
+  void insert_b(MSARegister wd, uint32_t n, Register rs);
+  void insert_h(MSARegister wd, uint32_t n, Register rs);
+  void insert_w(MSARegister wd, uint32_t n, Register rs);
+  void insve_b(MSARegister wd, uint32_t n, MSARegister ws);
+  void insve_h(MSARegister wd, uint32_t n, MSARegister ws);
+  void insve_w(MSARegister wd, uint32_t n, MSARegister ws);
+  void insve_d(MSARegister wd, uint32_t n, MSARegister ws);
+  void move_v(MSARegister wd, MSARegister ws);
+  void ctcmsa(MSAControlRegister cd, Register rs);
+  void cfcmsa(Register rd, MSAControlRegister cs);
+
+  void slli_b(MSARegister wd, MSARegister ws, uint32_t m);
+  void slli_h(MSARegister wd, MSARegister ws, uint32_t m);
+  void slli_w(MSARegister wd, MSARegister ws, uint32_t m);
+  void slli_d(MSARegister wd, MSARegister ws, uint32_t m);
+  void srai_b(MSARegister wd, MSARegister ws, uint32_t m);
+  void srai_h(MSARegister wd, MSARegister ws, uint32_t m);
+  void srai_w(MSARegister wd, MSARegister ws, uint32_t m);
+  void srai_d(MSARegister wd, MSARegister ws, uint32_t m);
+  void srli_b(MSARegister wd, MSARegister ws, uint32_t m);
+  void srli_h(MSARegister wd, MSARegister ws, uint32_t m);
+  void srli_w(MSARegister wd, MSARegister ws, uint32_t m);
+  void srli_d(MSARegister wd, MSARegister ws, uint32_t m);
+  void bclri_b(MSARegister wd, MSARegister ws, uint32_t m);
+  void bclri_h(MSARegister wd, MSARegister ws, uint32_t m);
+  void bclri_w(MSARegister wd, MSARegister ws, uint32_t m);
+  void bclri_d(MSARegister wd, MSARegister ws, uint32_t m);
+  void bseti_b(MSARegister wd, MSARegister ws, uint32_t m);
+  void bseti_h(MSARegister wd, MSARegister ws, uint32_t m);
+  void bseti_w(MSARegister wd, MSARegister ws, uint32_t m);
+  void bseti_d(MSARegister wd, MSARegister ws, uint32_t m);
+  void bnegi_b(MSARegister wd, MSARegister ws, uint32_t m);
+  void bnegi_h(MSARegister wd, MSARegister ws, uint32_t m);
+  void bnegi_w(MSARegister wd, MSARegister ws, uint32_t m);
+  void bnegi_d(MSARegister wd, MSARegister ws, uint32_t m);
+  void binsli_b(MSARegister wd, MSARegister ws, uint32_t m);
+  void binsli_h(MSARegister wd, MSARegister ws, uint32_t m);
+  void binsli_w(MSARegister wd, MSARegister ws, uint32_t m);
+  void binsli_d(MSARegister wd, MSARegister ws, uint32_t m);
+  void binsri_b(MSARegister wd, MSARegister ws, uint32_t m);
+  void binsri_h(MSARegister wd, MSARegister ws, uint32_t m);
+  void binsri_w(MSARegister wd, MSARegister ws, uint32_t m);
+  void binsri_d(MSARegister wd, MSARegister ws, uint32_t m);
+  void sat_s_b(MSARegister wd, MSARegister ws, uint32_t m);
+  void sat_s_h(MSARegister wd, MSARegister ws, uint32_t m);
+  void sat_s_w(MSARegister wd, MSARegister ws, uint32_t m);
+  void sat_s_d(MSARegister wd, MSARegister ws, uint32_t m);
+  void sat_u_b(MSARegister wd, MSARegister ws, uint32_t m);
+  void sat_u_h(MSARegister wd, MSARegister ws, uint32_t m);
+  void sat_u_w(MSARegister wd, MSARegister ws, uint32_t m);
+  void sat_u_d(MSARegister wd, MSARegister ws, uint32_t m);
+  void srari_b(MSARegister wd, MSARegister ws, uint32_t m);
+  void srari_h(MSARegister wd, MSARegister ws, uint32_t m);
+  void srari_w(MSARegister wd, MSARegister ws, uint32_t m);
+  void srari_d(MSARegister wd, MSARegister ws, uint32_t m);
+  void srlri_b(MSARegister wd, MSARegister ws, uint32_t m);
+  void srlri_h(MSARegister wd, MSARegister ws, uint32_t m);
+  void srlri_w(MSARegister wd, MSARegister ws, uint32_t m);
+  void srlri_d(MSARegister wd, MSARegister ws, uint32_t m);
+
   // Check the code size generated from label to here.
   int SizeOfCodeGeneratedSince(Label* label) {
     return pc_offset() - label->pos();
@@ -1017,38 +1399,16 @@ class Assembler : public AssemblerBase {
     DISALLOW_IMPLICIT_CONSTRUCTORS(BlockGrowBufferScope);
   };
 
-  // Debugging.
-
-  // Mark generator continuation.
-  void RecordGeneratorContinuation();
-
-  // Mark address of a debug break slot.
-  void RecordDebugBreakSlot(RelocInfo::Mode mode);
-
-  // Record the AST id of the CallIC being compiled, so that it can be placed
-  // in the relocation information.
-  void SetRecordedAstId(TypeFeedbackId ast_id) {
-    DCHECK(recorded_ast_id_.IsNone());
-    recorded_ast_id_ = ast_id;
-  }
-
-  TypeFeedbackId RecordedAstId() {
-    DCHECK(!recorded_ast_id_.IsNone());
-    return recorded_ast_id_;
-  }
-
-  void ClearRecordedAstId() { recorded_ast_id_ = TypeFeedbackId::None(); }
-
-  // Record a comment relocation entry that can be used by a disassembler.
-  // Use --code-comments to enable.
-  void RecordComment(const char* msg);
-
   // Record a deoptimization reason that can be used by a log or cpu profiler.
   // Use --trace-deopt to enable.
-  void RecordDeoptReason(const int reason, int raw_position, int id);
+  void RecordDeoptReason(DeoptimizeReason reason, SourcePosition position,
+                         int id);
 
-  static int RelocateInternalReference(RelocInfo::Mode rmode, byte* pc,
+  static int RelocateInternalReference(RelocInfo::Mode rmode, Address pc,
                                        intptr_t pc_delta);
+
+  static void RelocateRelativeReference(RelocInfo::Mode rmode, Address pc,
+                                        intptr_t pc_delta);
 
   // Writes a single byte or word of data in the code stream.  Used for
   // inline tables, e.g., jump-tables.
@@ -1057,10 +1417,6 @@ class Assembler : public AssemblerBase {
   void dq(uint64_t data);
   void dp(uintptr_t data) { dd(data); }
   void dd(Label* label);
-
-  AssemblerPositionsRecorder* positions_recorder() {
-    return &positions_recorder_;
-  }
 
   // Postpone the generation of the trampoline pool for the specified number of
   // instructions.
@@ -1075,18 +1431,22 @@ class Assembler : public AssemblerBase {
   inline int available_space() const { return reloc_info_writer.pos() - pc_; }
 
   // Read/patch instructions.
-  static Instr instr_at(byte* pc) { return *reinterpret_cast<Instr*>(pc); }
-  static void instr_at_put(byte* pc, Instr instr) {
+  static Instr instr_at(Address pc) { return *reinterpret_cast<Instr*>(pc); }
+  static void instr_at_put(Address pc, Instr instr) {
     *reinterpret_cast<Instr*>(pc) = instr;
   }
-  Instr instr_at(int pos) { return *reinterpret_cast<Instr*>(buffer_ + pos); }
+  Instr instr_at(int pos) {
+    return *reinterpret_cast<Instr*>(buffer_start_ + pos);
+  }
   void instr_at_put(int pos, Instr instr) {
-    *reinterpret_cast<Instr*>(buffer_ + pos) = instr;
+    *reinterpret_cast<Instr*>(buffer_start_ + pos) = instr;
   }
 
   // Check if an instruction is a branch of some kind.
   static bool IsBranch(Instr instr);
+  static bool IsMsaBranch(Instr instr);
   static bool IsBc(Instr instr);
+  static bool IsNal(Instr instr);
   static bool IsBzc(Instr instr);
   static bool IsBeq(Instr instr);
   static bool IsBne(Instr instr);
@@ -1095,11 +1455,13 @@ class Assembler : public AssemblerBase {
   static bool IsBeqc(Instr instr);
   static bool IsBnec(Instr instr);
   static bool IsJicOrJialc(Instr instr);
+  static bool IsMov(Instr instr, Register rd, Register rs);
 
   static bool IsJump(Instr instr);
   static bool IsJ(Instr instr);
   static bool IsLui(Instr instr);
   static bool IsOri(Instr instr);
+  static bool IsAddu(Instr instr, Register rd, Register rs, Register rt);
 
   static bool IsJal(Instr instr);
   static bool IsJr(Instr instr);
@@ -1154,14 +1516,14 @@ class Assembler : public AssemblerBase {
 
   void CheckTrampolinePool();
 
-  void PatchConstantPoolAccessInstruction(int pc_offset, int offset,
-                                          ConstantPoolEntry::Access access,
-                                          ConstantPoolEntry::Type type) {
-    // No embedded constant pool support.
-    UNREACHABLE();
+  bool IsPrevInstrCompactBranch() { return prev_instr_compact_branch_; }
+  static bool IsCompactBranchSupported() {
+    return IsMipsArchVariant(kMips32r6);
   }
 
-  bool IsPrevInstrCompactBranch() { return prev_instr_compact_branch_; }
+  // Get the code target object for a pc-relative call or jump.
+  V8_INLINE Handle<Code> relative_code_target_object_handle_at(
+      Address pc_) const;
 
   inline int UnboundLabelsCount() { return unbound_labels_count_; }
 
@@ -1169,13 +1531,18 @@ class Assembler : public AssemblerBase {
   // Load Scaled Address instruction.
   void lsa(Register rd, Register rt, Register rs, uint8_t sa);
 
-  // Helpers.
-  void LoadRegPlusOffsetToAt(const MemOperand& src);
+  // Readable constants for base and offset adjustment helper, these indicate if
+  // aside from offset, another value like offset + 4 should fit into int16.
+  enum class OffsetAccessType : bool {
+    SINGLE_ACCESS = false,
+    TWO_ACCESSES = true
+  };
 
-  // Relocation for a type-recording IC has the AST id added to it.  This
-  // member variable is a way to pass the information from the call site to
-  // the relocation info.
-  TypeFeedbackId recorded_ast_id_;
+  // Helper function for memory load/store using base register and offset.
+  void AdjustBaseAndOffset(
+      MemOperand& src,
+      OffsetAccessType access_type = OffsetAccessType::SINGLE_ACCESS,
+      int second_access_add_to_offset = 4);
 
   int32_t buffer_space() const { return reloc_info_writer.pos() - pc_; }
 
@@ -1191,6 +1558,9 @@ class Assembler : public AssemblerBase {
   // Record reloc info for current pc_.
   void RecordRelocInfo(RelocInfo::Mode rmode, intptr_t data = 0);
 
+  // Read 32-bit immediate from lui, ori pair that is used to load immediate.
+  static int32_t GetLuiOriImmediate(Instr instr1, Instr instr2);
+
   // Block the emission of the trampoline pool before pc_offset.
   void BlockTrampolinePoolBefore(int pc_offset) {
     if (no_trampoline_pool_before_ < pc_offset)
@@ -1203,6 +1573,9 @@ class Assembler : public AssemblerBase {
 
   void EndBlockTrampolinePool() {
     trampoline_pool_blocked_nesting_--;
+    if (trampoline_pool_blocked_nesting_ == 0) {
+      CheckTrampolinePoolQuick(1);
+    }
   }
 
   bool is_trampoline_pool_blocked() const {
@@ -1212,8 +1585,6 @@ class Assembler : public AssemblerBase {
   bool has_exception() const {
     return internal_trampoline_exception_;
   }
-
-  void DoubleAsTwoUInt32(double d, uint32_t* lo, uint32_t* hi);
 
   bool is_trampoline_emitted() const {
     return trampoline_emitted_;
@@ -1240,31 +1611,46 @@ class Assembler : public AssemblerBase {
     }
   }
 
-  inline void CheckTrampolinePoolQuick(int extra_instructions = 0);
+  inline void CheckTrampolinePoolQuick(int extra_instructions = 0) {
+    if (pc_offset() >= next_buffer_check_ - extra_instructions * kInstrSize) {
+      CheckTrampolinePool();
+    }
+  }
 
   inline void CheckBuffer();
 
+  RegList scratch_register_list_;
+
+  // Generate common instruction sequence.
+  void GenPCRelativeJump(Register tf, Register ts, int32_t imm32,
+                         RelocInfo::Mode rmode, BranchDelaySlot bdslot);
+  void GenPCRelativeJumpAndLink(Register t, int32_t imm32,
+                                RelocInfo::Mode rmode, BranchDelaySlot bdslot);
+
  private:
+  // Avoid overflows for displacements etc.
+  static const int kMaximalBufferSize = 512 * MB;
+
   inline static void set_target_internal_reference_encoded_at(Address pc,
                                                               Address target);
 
   // Buffer size and constant pool distance are checked together at regular
   // intervals of kBufferCheckInterval emitted bytes.
-  static const int kBufferCheckInterval = 1*KB/2;
+  static constexpr int kBufferCheckInterval = 1 * KB / 2;
 
   // Code generation.
   // The relocation writer's position is at least kGap bytes below the end of
   // the generated instructions. This is so that multi-instruction sequences do
   // not have to check for overflow. The same is true for writes of large
   // relocation info entries.
-  static const int kGap = 32;
-
+  static constexpr int kGap = 32;
 
   // Repeated checking whether the trampoline pool should be emitted is rather
   // expensive. By default we only check again once a number of instructions
   // has been generated.
-  static const int kCheckConstIntervalInst = 32;
-  static const int kCheckConstInterval = kCheckConstIntervalInst * kInstrSize;
+  static constexpr int kCheckConstIntervalInst = 32;
+  static constexpr int kCheckConstInterval =
+      kCheckConstIntervalInst * kInstrSize;
 
   int next_buffer_check_;  // pc offset of next buffer check.
 
@@ -1280,7 +1666,7 @@ class Assembler : public AssemblerBase {
 
   // Relocation information generation.
   // Each relocation is encoded as a variable size value.
-  static const int kMaxRelocSize = RelocInfoWriter::kMaxSize;
+  static constexpr int kMaxRelocSize = RelocInfoWriter::kMaxSize;
   RelocInfoWriter reloc_info_writer;
 
   // The bound position, before this we cannot do instruction elimination.
@@ -1307,12 +1693,8 @@ class Assembler : public AssemblerBase {
   // few aliases, but mixing both does not look clean to me.
   // Anyway we could surely implement this differently.
 
-  void GenInstrRegister(Opcode opcode,
-                        Register rs,
-                        Register rt,
-                        Register rd,
-                        uint16_t sa = 0,
-                        SecondaryField func = NULLSF);
+  void GenInstrRegister(Opcode opcode, Register rs, Register rt, Register rd,
+                        uint16_t sa = 0, SecondaryField func = nullptrSF);
 
   void GenInstrRegister(Opcode opcode,
                         Register rs,
@@ -1321,32 +1703,20 @@ class Assembler : public AssemblerBase {
                         uint16_t lsb,
                         SecondaryField func);
 
-  void GenInstrRegister(Opcode opcode,
-                        SecondaryField fmt,
-                        FPURegister ft,
-                        FPURegister fs,
-                        FPURegister fd,
-                        SecondaryField func = NULLSF);
+  void GenInstrRegister(Opcode opcode, SecondaryField fmt, FPURegister ft,
+                        FPURegister fs, FPURegister fd,
+                        SecondaryField func = nullptrSF);
 
-  void GenInstrRegister(Opcode opcode,
-                        FPURegister fr,
-                        FPURegister ft,
-                        FPURegister fs,
-                        FPURegister fd,
-                        SecondaryField func = NULLSF);
+  void GenInstrRegister(Opcode opcode, FPURegister fr, FPURegister ft,
+                        FPURegister fs, FPURegister fd,
+                        SecondaryField func = nullptrSF);
 
-  void GenInstrRegister(Opcode opcode,
-                        SecondaryField fmt,
-                        Register rt,
-                        FPURegister fs,
-                        FPURegister fd,
-                        SecondaryField func = NULLSF);
+  void GenInstrRegister(Opcode opcode, SecondaryField fmt, Register rt,
+                        FPURegister fs, FPURegister fd,
+                        SecondaryField func = nullptrSF);
 
-  void GenInstrRegister(Opcode opcode,
-                        SecondaryField fmt,
-                        Register rt,
-                        FPUControlRegister fs,
-                        SecondaryField func = NULLSF);
+  void GenInstrRegister(Opcode opcode, SecondaryField fmt, Register rt,
+                        FPUControlRegister fs, SecondaryField func = nullptrSF);
 
   void GenInstrImmediate(
       Opcode opcode, Register rs, Register rt, int32_t j,
@@ -1357,6 +1727,8 @@ class Assembler : public AssemblerBase {
   void GenInstrImmediate(
       Opcode opcode, Register r1, FPURegister r2, int32_t j,
       CompactBranchType is_compact_branch = CompactBranchType::NO);
+  void GenInstrImmediate(Opcode opcode, Register base, Register rt,
+                         int32_t offset9, int bit6, SecondaryField func);
   void GenInstrImmediate(
       Opcode opcode, Register rs, int32_t offset21,
       CompactBranchType is_compact_branch = CompactBranchType::NO);
@@ -1369,18 +1741,94 @@ class Assembler : public AssemblerBase {
   void GenInstrJump(Opcode opcode,
                      uint32_t address);
 
+  // MSA
+  void GenInstrMsaI8(SecondaryField operation, uint32_t imm8, MSARegister ws,
+                     MSARegister wd);
+
+  void GenInstrMsaI5(SecondaryField operation, SecondaryField df, int32_t imm5,
+                     MSARegister ws, MSARegister wd);
+
+  void GenInstrMsaBit(SecondaryField operation, SecondaryField df, uint32_t m,
+                      MSARegister ws, MSARegister wd);
+
+  void GenInstrMsaI10(SecondaryField operation, SecondaryField df,
+                      int32_t imm10, MSARegister wd);
+
+  template <typename RegType>
+  void GenInstrMsa3R(SecondaryField operation, SecondaryField df, RegType t,
+                     MSARegister ws, MSARegister wd);
+
+  template <typename DstType, typename SrcType>
+  void GenInstrMsaElm(SecondaryField operation, SecondaryField df, uint32_t n,
+                      SrcType src, DstType dst);
+
+  void GenInstrMsa3RF(SecondaryField operation, uint32_t df, MSARegister wt,
+                      MSARegister ws, MSARegister wd);
+
+  void GenInstrMsaVec(SecondaryField operation, MSARegister wt, MSARegister ws,
+                      MSARegister wd);
+
+  void GenInstrMsaMI10(SecondaryField operation, int32_t s10, Register rs,
+                       MSARegister wd);
+
+  void GenInstrMsa2R(SecondaryField operation, SecondaryField df,
+                     MSARegister ws, MSARegister wd);
+
+  void GenInstrMsa2RF(SecondaryField operation, SecondaryField df,
+                      MSARegister ws, MSARegister wd);
+
+  void GenInstrMsaBranch(SecondaryField operation, MSARegister wt,
+                         int32_t offset16);
+
+  inline bool is_valid_msa_df_m(SecondaryField bit_df, uint32_t m) {
+    switch (bit_df) {
+      case BIT_DF_b:
+        return is_uint3(m);
+      case BIT_DF_h:
+        return is_uint4(m);
+      case BIT_DF_w:
+        return is_uint5(m);
+      case BIT_DF_d:
+        return is_uint6(m);
+      default:
+        return false;
+    }
+  }
+
+  inline bool is_valid_msa_df_n(SecondaryField elm_df, uint32_t n) {
+    switch (elm_df) {
+      case ELM_DF_B:
+        return is_uint4(n);
+      case ELM_DF_H:
+        return is_uint3(n);
+      case ELM_DF_W:
+        return is_uint2(n);
+      case ELM_DF_D:
+        return is_uint1(n);
+      default:
+        return false;
+    }
+  }
 
   // Labels.
-  void print(Label* L);
+  void print(const Label* L);
   void bind_to(Label* L, int pos);
   void next(Label* L, bool is_internal);
+
+  // Patching lui/ori pair which is commonly used for loading constants.
+  static void PatchLuiOriImmediate(Address pc, int32_t imm, Instr instr1,
+                                   Address offset_lui, Instr instr2,
+                                   Address offset_ori);
+  void PatchLuiOriImmediate(int pc, int32_t imm, Instr instr1,
+                            Address offset_lui, Instr instr2,
+                            Address offset_ori);
 
   // One trampoline consists of:
   // - space for trampoline slots,
   // - space for labels.
   //
   // Space for trampoline slots is equal to slot_count * 2 * kInstrSize.
-  // Space for trampoline slots preceeds space for labels. Each label is of one
+  // Space for trampoline slots precedes space for labels. Each label is of one
   // instruction size, so total amount for labels is equal to
   // label_count *  kInstrSize.
   class Trampoline {
@@ -1434,18 +1882,15 @@ class Assembler : public AssemblerBase {
   // branch instruction generation, where we use jump instructions rather
   // than regular branch instructions.
   bool trampoline_emitted_;
-#ifdef _MIPS_ARCH_MIPS32R6
-  static const int kTrampolineSlotsSize = 2 * kInstrSize;
-#else
-  static const int kTrampolineSlotsSize = 4 * kInstrSize;
-#endif
-  static const int kMaxBranchOffset = (1 << (18 - 1)) - 1;
-  static const int kMaxCompactBranchOffset = (1 << (28 - 1)) - 1;
-  static const int kInvalidSlotPos = -1;
+  static constexpr int kInvalidSlotPos = -1;
 
   // Internal reference positions, required for unbounded internal reference
   // labels.
   std::set<int> internal_reference_positions_;
+  bool is_internal_reference(Label* L) {
+    return internal_reference_positions_.find(L->pos()) !=
+           internal_reference_positions_.end();
+  }
 
   void EmittedCompactBranchInstruction() { prev_instr_compact_branch_ = true; }
   void ClearCompactBranchState() { prev_instr_compact_branch_ = false; }
@@ -1454,25 +1899,37 @@ class Assembler : public AssemblerBase {
   Trampoline trampoline_;
   bool internal_trampoline_exception_;
 
+ private:
+  void AllocateAndInstallRequestedHeapObjects(Isolate* isolate);
+
+  int WriteCodeComments();
+
   friend class RegExpMacroAssemblerMIPS;
   friend class RelocInfo;
-  friend class CodePatcher;
   friend class BlockTrampolinePoolScope;
-
-  AssemblerPositionsRecorder positions_recorder_;
-  friend class AssemblerPositionsRecorder;
   friend class EnsureSpace;
 };
 
-
-class EnsureSpace BASE_EMBEDDED {
+class EnsureSpace {
  public:
-  explicit EnsureSpace(Assembler* assembler) {
-    assembler->CheckBuffer();
-  }
+  explicit inline EnsureSpace(Assembler* assembler);
 };
+
+class UseScratchRegisterScope {
+ public:
+  explicit UseScratchRegisterScope(Assembler* assembler);
+  ~UseScratchRegisterScope();
+
+  Register Acquire();
+  bool hasAvailable() const;
+
+ private:
+  RegList* available_;
+  RegList old_available_;
+};
+
 
 }  // namespace internal
 }  // namespace v8
 
-#endif  // V8_ARM_ASSEMBLER_MIPS_H_
+#endif  // V8_MIPS_ASSEMBLER_MIPS_H_

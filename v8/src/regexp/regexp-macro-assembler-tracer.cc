@@ -5,6 +5,7 @@
 #include "src/regexp/regexp-macro-assembler-tracer.h"
 
 #include "src/ast/ast.h"
+#include "src/objects-inl.h"
 
 namespace v8 {
 namespace internal {
@@ -12,17 +13,14 @@ namespace internal {
 RegExpMacroAssemblerTracer::RegExpMacroAssemblerTracer(
     Isolate* isolate, RegExpMacroAssembler* assembler)
     : RegExpMacroAssembler(isolate, assembler->zone()), assembler_(assembler) {
-  unsigned int type = assembler->Implementation();
-  DCHECK(type < 8);
-  const char* impl_names[] = {"IA32", "ARM", "ARM64", "MIPS",
+  IrregexpImplementation type = assembler->Implementation();
+  DCHECK_LT(type, 9);
+  const char* impl_names[] = {"IA32", "ARM", "ARM64", "MIPS",    "S390",
                               "PPC",  "X64", "X87",   "Bytecode"};
   PrintF("RegExpMacroAssembler%s();\n", impl_names[type]);
 }
 
-
-RegExpMacroAssemblerTracer::~RegExpMacroAssemblerTracer() {
-}
-
+RegExpMacroAssemblerTracer::~RegExpMacroAssemblerTracer() = default;
 
 void RegExpMacroAssemblerTracer::AbortedCodeGeneration() {
   PrintF(" AbortedCodeGeneration\n");

@@ -7,6 +7,7 @@
 
 #include <sys/types.h>
 #include "src/globals.h"
+#include "src/third_party/utf8-decoder/utf8-decoder.h"
 #include "src/utils.h"
 /**
  * \file
@@ -24,10 +25,11 @@ typedef unsigned char byte;
  */
 const int kMaxMappingSize = 4;
 
+#ifndef V8_INTL_SUPPORT
 template <class T, int size = 256>
 class Predicate {
  public:
-  inline Predicate() { }
+  inline Predicate() = default;
   inline bool get(uchar c);
 
  private:
@@ -38,8 +40,12 @@ class Predicate {
     inline CacheEntry()
         : bit_field_(CodePointField::encode(0) | ValueField::encode(0)) {}
     inline CacheEntry(uchar code_point, bool value)
-        : bit_field_(CodePointField::encode(code_point) |
-                     ValueField::encode(value)) {}
+        : bit_field_(
+              CodePointField::encode(CodePointField::kMask & code_point) |
+              ValueField::encode(value)) {
+      DCHECK_IMPLIES((CodePointField::kMask & code_point) != code_point,
+                     code_point == static_cast<uchar>(-1));
+    }
 
     uchar code_point() const { return CodePointField::decode(bit_field_); }
     bool value() const { return ValueField::decode(bit_field_); }
@@ -63,7 +69,7 @@ class Predicate {
 template <class T, int size = 256>
 class Mapping {
  public:
-  inline Mapping() { }
+  inline Mapping() = default;
   inline int get(uchar c, uchar n, uchar* result);
  private:
   friend class Test;
@@ -82,7 +88,6 @@ class Mapping {
   CacheEntry entries_[kSize];
 };
 
-
 class UnicodeData {
  private:
   friend class Test;
@@ -90,25 +95,24 @@ class UnicodeData {
   static const uchar kMaxCodePoint;
 };
 
+#endif  // !V8_INTL_SUPPORT
 
 class Utf16 {
  public:
+  static const int kNoPreviousCharacter = -1;
   static inline bool IsSurrogatePair(int lead, int trail) {
     return IsLeadSurrogate(lead) && IsTrailSurrogate(trail);
   }
   static inline bool IsLeadSurrogate(int code) {
-    if (code == kNoPreviousCharacter) return false;
     return (code & 0xfc00) == 0xd800;
   }
   static inline bool IsTrailSurrogate(int code) {
-    if (code == kNoPreviousCharacter) return false;
     return (code & 0xfc00) == 0xdc00;
   }
 
   static inline int CombineSurrogatePair(uchar lead, uchar trail) {
     return 0x10000 + ((lead & 0x3ff) << 10) + (trail & 0x3ff);
   }
-  static const int kNoPreviousCharacter = -1;
   static const uchar kMaxNonSurrogateCharCode = 0xffff;
   // Encoding a single UTF-16 code unit will produce 1, 2 or 3 bytes
   // of UTF-8 data.  The special case where the unit is a surrogate
@@ -127,9 +131,10 @@ class Utf16 {
   }
 };
 
-
-class Utf8 {
+class V8_EXPORT_PRIVATE Utf8 {
  public:
+  using State = Utf8DfaDecoder::State;
+
   static inline uchar Length(uchar chr, int previous);
   static inline unsigned EncodeOneByte(char* out, uint8_t c);
   static inline unsigned Encode(char* out,
@@ -141,6 +146,8 @@ class Utf8 {
   // The unicode replacement character, used to signal invalid unicode
   // sequences (e.g. an orphan surrogate) when converting to a UTF-8 encoding.
   static const uchar kBadChar = 0xFFFD;
+  static const uchar kBufferEmpty = 0x0;
+  static const uchar kIncomplete = 0xFFFFFFFC;  // any non-valid code point.
   static const unsigned kMaxEncodedSize   = 4;
   static const unsigned kMaxOneByteChar   = 0x7f;
   static const unsigned kMaxTwoByteChar   = 0x7ff;
@@ -156,33 +163,55 @@ class Utf8 {
   static const unsigned kMax16BitCodeUnitSize  = 3;
   static inline uchar ValueOf(const byte* str, size_t length, size_t* cursor);
 
+  typedef uint32_t Utf8IncrementalBuffer;
+  static inline uchar ValueOfIncremental(const byte** cursor, State* state,
+                                         Utf8IncrementalBuffer* buffer);
+  static uchar ValueOfIncrementalFinish(State* state);
+
   // Excludes non-characters from the set of valid code points.
   static inline bool IsValidCharacter(uchar c);
 
-  static bool Validate(const byte* str, size_t length);
+  // Validate if the input has a valid utf-8 encoding. Unlike JS source code
+  // this validation function will accept any unicode code point, including
+  // kBadChar and BOMs.
+  //
+  // This method checks for:
+  // - valid utf-8 endcoding (e.g. no over-long encodings),
+  // - absence of surrogates,
+  // - valid code point range.
+  static bool ValidateEncoding(const byte* str, size_t length);
 };
 
 struct Uppercase {
   static bool Is(uchar c);
 };
-struct Lowercase {
-  static bool Is(uchar c);
-};
 struct Letter {
   static bool Is(uchar c);
 };
-struct ID_Start {
+#ifndef V8_INTL_SUPPORT
+struct V8_EXPORT_PRIVATE ID_Start {
   static bool Is(uchar c);
 };
-struct ID_Continue {
+struct V8_EXPORT_PRIVATE ID_Continue {
   static bool Is(uchar c);
 };
-struct WhiteSpace {
+struct V8_EXPORT_PRIVATE WhiteSpace {
   static bool Is(uchar c);
 };
-struct LineTerminator {
-  static bool Is(uchar c);
-};
+#endif  // !V8_INTL_SUPPORT
+
+// LineTerminator:       'JS_Line_Terminator' in point.properties
+// ES#sec-line-terminators lists exactly 4 code points:
+// LF (U+000A), CR (U+000D), LS(U+2028), PS(U+2029)
+V8_INLINE bool IsLineTerminator(uchar c) {
+  return c == 0x000A || c == 0x000D || c == 0x2028 || c == 0x2029;
+}
+
+V8_INLINE bool IsStringLiteralLineTerminator(uchar c) {
+  return c == 0x000A || c == 0x000D;
+}
+
+#ifndef V8_INTL_SUPPORT
 struct ToLowercase {
   static const int kMaxWidth = 3;
   static const bool kIsToLower = true;
@@ -199,27 +228,28 @@ struct ToUppercase {
                      uchar* result,
                      bool* allow_caching_ptr);
 };
-struct Ecma262Canonicalize {
+struct V8_EXPORT_PRIVATE Ecma262Canonicalize {
   static const int kMaxWidth = 1;
   static int Convert(uchar c,
                      uchar n,
                      uchar* result,
                      bool* allow_caching_ptr);
 };
-struct Ecma262UnCanonicalize {
+struct V8_EXPORT_PRIVATE Ecma262UnCanonicalize {
   static const int kMaxWidth = 4;
   static int Convert(uchar c,
                      uchar n,
                      uchar* result,
                      bool* allow_caching_ptr);
 };
-struct CanonicalizationRange {
+struct V8_EXPORT_PRIVATE CanonicalizationRange {
   static const int kMaxWidth = 1;
   static int Convert(uchar c,
                      uchar n,
                      uchar* result,
                      bool* allow_caching_ptr);
 };
+#endif  // !V8_INTL_SUPPORT
 
 }  // namespace unibrow
 

@@ -17,27 +17,6 @@ const double GCIdleTimeHandler::kHighContextDisposalRate = 100;
 const size_t GCIdleTimeHandler::kMinTimeForOverApproximatingWeakClosureInMs = 1;
 
 
-void GCIdleTimeAction::Print() {
-  switch (type) {
-    case DONE:
-      PrintF("done");
-      break;
-    case DO_NOTHING:
-      PrintF("no action");
-      break;
-    case DO_INCREMENTAL_STEP:
-      PrintF("incremental step");
-      if (additional_work) {
-        PrintF("; finalized marking");
-      }
-      break;
-    case DO_FULL_GC:
-      PrintF("full GC");
-      break;
-  }
-}
-
-
 void GCIdleTimeHeapState::Print() {
   PrintF("contexts_disposed=%d ", contexts_disposed);
   PrintF("contexts_disposal_rate=%f ", contexts_disposal_rate);
@@ -47,7 +26,7 @@ void GCIdleTimeHeapState::Print() {
 
 size_t GCIdleTimeHandler::EstimateMarkingStepSize(
     double idle_time_in_ms, double marking_speed_in_bytes_per_ms) {
-  DCHECK(idle_time_in_ms > 0);
+  DCHECK_LT(0, idle_time_in_ms);
 
   if (marking_speed_in_bytes_per_ms == 0) {
     marking_speed_in_bytes_per_ms = kInitialConservativeMarkingSpeed;
@@ -73,9 +52,11 @@ double GCIdleTimeHandler::EstimateFinalIncrementalMarkCompactTime(
 }
 
 bool GCIdleTimeHandler::ShouldDoContextDisposalMarkCompact(
-    int contexts_disposed, double contexts_disposal_rate) {
+    int contexts_disposed, double contexts_disposal_rate,
+    size_t size_of_objects) {
   return contexts_disposed > 0 && contexts_disposal_rate > 0 &&
-         contexts_disposal_rate < kHighContextDisposalRate;
+         contexts_disposal_rate < kHighContextDisposalRate &&
+         size_of_objects <= kMaxHeapSizeForContextDisposalMarkCompact;
 }
 
 bool GCIdleTimeHandler::ShouldDoFinalIncrementalMarkCompact(
@@ -94,26 +75,13 @@ bool GCIdleTimeHandler::ShouldDoOverApproximateWeakClosure(
 }
 
 
-GCIdleTimeAction GCIdleTimeHandler::NothingOrDone(double idle_time_in_ms) {
-  if (idle_time_in_ms >= kMinBackgroundIdleTime) {
-    return GCIdleTimeAction::Nothing();
-  }
-  if (idle_times_which_made_no_progress_ >= kMaxNoProgressIdleTimes) {
-    return GCIdleTimeAction::Done();
-  } else {
-    idle_times_which_made_no_progress_++;
-    return GCIdleTimeAction::Nothing();
-  }
-}
-
-
 // The following logic is implemented by the controller:
 // (1) If we don't have any idle time, do nothing, unless a context was
 // disposed, incremental marking is stopped, and the heap is small. Then do
 // a full GC.
 // (2) If the context disposal rate is high and we cannot perform a full GC,
 // we do nothing until the context disposal rate becomes lower.
-// (3) If the new space is almost full and we can affort a scavenge or if the
+// (3) If the new space is almost full and we can afford a scavenge or if the
 // next scavenge will very likely take long, then a scavenge is performed.
 // (4) If sweeping is in progress and we received a large enough idle time
 // request, we finalize sweeping here.
@@ -123,29 +91,23 @@ GCIdleTimeAction GCIdleTimeHandler::Compute(double idle_time_in_ms,
                                             GCIdleTimeHeapState heap_state) {
   if (static_cast<int>(idle_time_in_ms) <= 0) {
     if (heap_state.incremental_marking_stopped) {
-      if (ShouldDoContextDisposalMarkCompact(
-              heap_state.contexts_disposed,
-              heap_state.contexts_disposal_rate)) {
-        return GCIdleTimeAction::FullGC();
+      if (ShouldDoContextDisposalMarkCompact(heap_state.contexts_disposed,
+                                             heap_state.contexts_disposal_rate,
+                                             heap_state.size_of_objects)) {
+        return GCIdleTimeAction::kFullGC;
       }
     }
-    return GCIdleTimeAction::Nothing();
+    return GCIdleTimeAction::kDone;
   }
 
-  // We are in a context disposal GC scenario. Don't do anything if we do not
-  // get the right idle signal.
-  if (ShouldDoContextDisposalMarkCompact(heap_state.contexts_disposed,
-                                         heap_state.contexts_disposal_rate)) {
-    return NothingOrDone(idle_time_in_ms);
+  if (FLAG_incremental_marking && !heap_state.incremental_marking_stopped) {
+    return GCIdleTimeAction::kIncrementalStep;
   }
 
-  if (!FLAG_incremental_marking || heap_state.incremental_marking_stopped) {
-    return GCIdleTimeAction::Done();
-  }
-
-  return GCIdleTimeAction::IncrementalStep();
+  return GCIdleTimeAction::kDone;
 }
 
+bool GCIdleTimeHandler::Enabled() { return FLAG_incremental_marking; }
 
 }  // namespace internal
 }  // namespace v8

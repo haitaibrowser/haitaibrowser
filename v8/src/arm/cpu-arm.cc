@@ -14,13 +14,15 @@
 
 #if V8_TARGET_ARCH_ARM
 
-#include "src/assembler.h"
-#include "src/macro-assembler.h"
+#include "src/cpu-features.h"
 
 namespace v8 {
 namespace internal {
 
-void CpuFeatures::FlushICache(void* start, size_t size) {
+// The inlining of this seems to trigger an LTO bug that clobbers a register on
+// arm, see https://crbug.com/952759#c6.
+__attribute__((noinline)) void CpuFeatures::FlushICache(void* start,
+                                                        size_t size) {
 #if !defined(USE_SIMULATOR)
 #if V8_OS_QNX
   msync(start, size, MS_SYNC | MS_INVALIDATE_ICACHE);

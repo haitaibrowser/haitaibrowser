@@ -10,50 +10,11 @@
 namespace v8 {
 namespace internal {
 
-enum GCIdleTimeActionType {
-  DONE,
-  DO_NOTHING,
-  DO_INCREMENTAL_STEP,
-  DO_FULL_GC,
+enum class GCIdleTimeAction : uint8_t {
+  kDone,
+  kIncrementalStep,
+  kFullGC,
 };
-
-
-class GCIdleTimeAction {
- public:
-  static GCIdleTimeAction Done() {
-    GCIdleTimeAction result;
-    result.type = DONE;
-    result.additional_work = false;
-    return result;
-  }
-
-  static GCIdleTimeAction Nothing() {
-    GCIdleTimeAction result;
-    result.type = DO_NOTHING;
-    result.additional_work = false;
-    return result;
-  }
-
-  static GCIdleTimeAction IncrementalStep() {
-    GCIdleTimeAction result;
-    result.type = DO_INCREMENTAL_STEP;
-    result.additional_work = false;
-    return result;
-  }
-
-  static GCIdleTimeAction FullGC() {
-    GCIdleTimeAction result;
-    result.type = DO_FULL_GC;
-    result.additional_work = false;
-    return result;
-  }
-
-  void Print();
-
-  GCIdleTimeActionType type;
-  bool additional_work;
-};
-
 
 class GCIdleTimeHeapState {
  public:
@@ -68,7 +29,7 @@ class GCIdleTimeHeapState {
 
 // The idle time handler makes decisions about which garbage collection
 // operations are executing during IdleNotification.
-class GCIdleTimeHandler {
+class V8_EXPORT_PRIVATE GCIdleTimeHandler {
  public:
   // If we haven't recorded any incremental marking events yet, we carefully
   // mark with a conservative lower bound for the marking speed.
@@ -107,6 +68,8 @@ class GCIdleTimeHandler {
   // considered low
   static const size_t kLowAllocationThroughput = 1000;
 
+  static const size_t kMaxHeapSizeForContextDisposalMarkCompact = 100 * MB;
+
   // If contexts are disposed at a higher rate a full gc is triggered.
   static const double kHighContextDisposalRate;
 
@@ -115,17 +78,12 @@ class GCIdleTimeHandler {
 
   static const size_t kMinTimeForOverApproximatingWeakClosureInMs;
 
-  // Number of times we will return a Nothing action in the current mode
-  // despite having idle time available before we returning a Done action to
-  // ensure we don't keep scheduling idle tasks and making no progress.
-  static const int kMaxNoProgressIdleTimes = 10;
-
-  GCIdleTimeHandler() : idle_times_which_made_no_progress_(0) {}
+  GCIdleTimeHandler() = default;
 
   GCIdleTimeAction Compute(double idle_time_in_ms,
                            GCIdleTimeHeapState heap_state);
 
-  void ResetNoProgressCounter() { idle_times_which_made_no_progress_ = 0; }
+  bool Enabled();
 
   static size_t EstimateMarkingStepSize(double idle_time_in_ms,
                                         double marking_speed_in_bytes_per_ms);
@@ -134,7 +92,8 @@ class GCIdleTimeHandler {
       size_t size_of_objects, double mark_compact_speed_in_bytes_per_ms);
 
   static bool ShouldDoContextDisposalMarkCompact(int context_disposed,
-                                                 double contexts_disposal_rate);
+                                                 double contexts_disposal_rate,
+                                                 size_t size_of_objects);
 
   static bool ShouldDoFinalIncrementalMarkCompact(
       double idle_time_in_ms, size_t size_of_objects,
@@ -143,11 +102,6 @@ class GCIdleTimeHandler {
   static bool ShouldDoOverApproximateWeakClosure(double idle_time_in_ms);
 
  private:
-  GCIdleTimeAction NothingOrDone(double idle_time_in_ms);
-
-  // Idle notifications with no progress.
-  int idle_times_which_made_no_progress_;
-
   DISALLOW_COPY_AND_ASSIGN(GCIdleTimeHandler);
 };
 

@@ -5,67 +5,24 @@
 // Declares a Simulator for S390 instructions if we are not generating a native
 // S390 binary. This Simulator allows us to run and debug S390 code generation
 // on regular desktop machines.
-// V8 calls into generated code by "calling" the CALL_GENERATED_CODE macro,
+// V8 calls into generated code via the GeneratedCode wrapper,
 // which will start execution in the Simulator or forwards to the real entry
 // on a S390 hardware platform.
 
 #ifndef V8_S390_SIMULATOR_S390_H_
 #define V8_S390_SIMULATOR_S390_H_
 
-#include "src/allocation.h"
+// globals.h defines USE_SIMULATOR.
+#include "src/globals.h"
 
-#if !defined(USE_SIMULATOR)
-// Running without a simulator on a native s390 platform.
-
-namespace v8 {
-namespace internal {
-
-// When running without a simulator we call the entry directly.
-#define CALL_GENERATED_CODE(isolate, entry, p0, p1, p2, p3, p4) \
-  (entry(p0, p1, p2, p3, p4))
-
-typedef int (*s390_regexp_matcher)(String*, int, const byte*, const byte*, int*,
-                                   int, Address, int, void*, Isolate*);
-
-// Call the generated regexp code directly. The code at the entry address
-// should act as a function matching the type ppc_regexp_matcher.
-// The ninth argument is a dummy that reserves the space used for
-// the return address added by the ExitFrame in native calls.
-#define CALL_GENERATED_REGEXP_CODE(isolate, entry, p0, p1, p2, p3, p4, p5, p6, \
-                                   p7, p8)                                     \
-  (FUNCTION_CAST<s390_regexp_matcher>(entry)(p0, p1, p2, p3, p4, p5, p6, p7,   \
-                                             NULL, p8))
-
-// The stack limit beyond which we will throw stack overflow errors in
-// generated code. Because generated code on s390 uses the C stack, we
-// just use the C stack limit.
-class SimulatorStack : public v8::internal::AllStatic {
- public:
-  static inline uintptr_t JsLimitFromCLimit(v8::internal::Isolate* isolate,
-                                            uintptr_t c_limit) {
-    USE(isolate);
-    return c_limit;
-  }
-
-  static inline uintptr_t RegisterCTryCatch(v8::internal::Isolate* isolate,
-                                            uintptr_t try_catch_address) {
-    USE(isolate);
-    return try_catch_address;
-  }
-
-  static inline void UnregisterCTryCatch(v8::internal::Isolate* isolate) {
-    USE(isolate);
-  }
-};
-}  // namespace internal
-}  // namespace v8
-
-#else  // !defined(USE_SIMULATOR)
+#if defined(USE_SIMULATOR)
 // Running with a simulator.
 
+#include "src/allocation.h"
 #include "src/assembler.h"
-#include "src/hashmap.h"
+#include "src/base/hashmap.h"
 #include "src/s390/constants-s390.h"
+#include "src/simulator-base.h"
 
 namespace v8 {
 namespace internal {
@@ -96,7 +53,7 @@ class CachePage {
   char validity_map_[kValidityMapSize];  // One byte per line.
 };
 
-class Simulator {
+class Simulator : public SimulatorBase {
  public:
   friend class S390Debugger;
   enum Register {
@@ -198,9 +155,7 @@ class Simulator {
   void set_pc(intptr_t value);
   intptr_t get_pc() const;
 
-  Address get_sp() const {
-    return reinterpret_cast<Address>(static_cast<intptr_t>(get_register(sp)));
-  }
+  Address get_sp() const { return static_cast<Address>(get_register(sp)); }
 
   // Accessor to the internal simulator stack area.
   uintptr_t StackLimit(uintptr_t c_limit) const;
@@ -208,19 +163,15 @@ class Simulator {
   // Executes S390 instructions until the PC reaches end_sim_pc.
   void Execute();
 
-  // Call on program start.
-  static void Initialize(Isolate* isolate);
+  template <typename Return, typename... Args>
+  Return Call(Address entry, Args... args) {
+    return VariadicCall<Return>(this, &Simulator::CallImpl, entry, args...);
+  }
 
-  static void TearDown(HashMap* i_cache, Redirection* first);
-
-  // V8 generally calls into generated JS code with 5 parameters and into
-  // generated RegExp code with 7 parameters. This is a convenience function,
-  // which sets up the simulator state and grabs the result on return.
-  intptr_t Call(byte* entry, int argument_count, ...);
   // Alternative: call a 2-argument double function.
-  void CallFP(byte* entry, double d0, double d1);
-  int32_t CallFPReturnsInt(byte* entry, double d0, double d1);
-  double CallFPReturnsDouble(byte* entry, double d0, double d1);
+  void CallFP(Address entry, double d0, double d1);
+  int32_t CallFPReturnsInt(Address entry, double d0, double d1);
+  double CallFPReturnsDouble(Address entry, double d0, double d1);
 
   // Push an address onto the JS stack.
   uintptr_t PushAddress(uintptr_t address);
@@ -232,8 +183,12 @@ class Simulator {
   void set_last_debugger_input(char* input);
   char* last_debugger_input() { return last_debugger_input_; }
 
+  // Redirection support.
+  static void SetRedirectInstruction(Instruction* instruction);
+
   // ICache checking.
-  static void FlushICache(v8::internal::HashMap* i_cache, void* start,
+  static bool ICacheMatch(void* one, void* two);
+  static void FlushICache(base::CustomMatcherHashMap* i_cache, void* start,
                           size_t size);
 
   // Returns true if pc register contains one of the 'special_values' defined
@@ -251,6 +206,9 @@ class Simulator {
     // C code.
     end_sim_pc = -2
   };
+
+  intptr_t CallImpl(Address entry, int argument_count,
+                    const intptr_t* arguments);
 
   // Unsupported instructions use Format to print an error and stop execution.
   void Format(Instruction* instr, const char* format);
@@ -282,6 +240,7 @@ class Simulator {
   // Byte Reverse
   inline int16_t ByteReverse(int16_t hword);
   inline int32_t ByteReverse(int32_t word);
+  inline int64_t ByteReverse(int64_t dword);
 
   // Read and write memory.
   inline uint8_t ReadBU(intptr_t addr);
@@ -297,27 +256,17 @@ class Simulator {
 
   inline uint32_t ReadWU(intptr_t addr, Instruction* instr);
   inline int32_t ReadW(intptr_t addr, Instruction* instr);
+  inline int64_t ReadW64(intptr_t addr, Instruction* instr);
   inline void WriteW(intptr_t addr, uint32_t value, Instruction* instr);
   inline void WriteW(intptr_t addr, int32_t value, Instruction* instr);
 
   inline int64_t ReadDW(intptr_t addr);
   inline double ReadDouble(intptr_t addr);
+  inline float ReadFloat(intptr_t addr);
   inline void WriteDW(intptr_t addr, int64_t value);
 
   // S390
   void Trace(Instruction* instr);
-  bool DecodeTwoByte(Instruction* instr);
-  bool DecodeFourByte(Instruction* instr);
-  bool DecodeFourByteArithmetic(Instruction* instr);
-  bool DecodeFourByteArithmetic64Bit(Instruction* instr);
-  bool DecodeFourByteFloatingPoint(Instruction* instr);
-  void DecodeFourByteFloatingPointIntConversion(Instruction* instr);
-  void DecodeFourByteFloatingPointRound(Instruction* instr);
-
-  bool DecodeSixByte(Instruction* instr);
-  bool DecodeSixByteArithmetic(Instruction* instr);
-  bool S390InstructionDecode(Instruction* instr);
-  void DecodeSixByteBitShift(Instruction* instr);
 
   // Used by the CL**BR instructions.
   template <typename T1, typename T2>
@@ -444,22 +393,19 @@ class Simulator {
   void ExecuteInstruction(Instruction* instr, bool auto_incr_pc = true);
 
   // ICache.
-  static void CheckICache(v8::internal::HashMap* i_cache, Instruction* instr);
-  static void FlushOnePage(v8::internal::HashMap* i_cache, intptr_t start,
+  static void CheckICache(base::CustomMatcherHashMap* i_cache,
+                          Instruction* instr);
+  static void FlushOnePage(base::CustomMatcherHashMap* i_cache, intptr_t start,
                            int size);
-  static CachePage* GetCachePage(v8::internal::HashMap* i_cache, void* page);
-
-  // Runtime call support.
-  static void* RedirectExternalReference(
-      Isolate* isolate, void* external_function,
-      v8::internal::ExternalReference::Type type);
+  static CachePage* GetCachePage(base::CustomMatcherHashMap* i_cache,
+                                 void* page);
 
   // Handle arguments and return value for runtime FP functions.
   void GetFpArgs(double* x, double* y, intptr_t* z);
   void SetFpResult(const double& result);
   void TrashCallerSaveRegisters();
 
-  void CallInternal(byte* entry, int reg_arg_count = 3);
+  void CallInternal(Address entry, int reg_arg_count = 3);
 
   // Architecture state.
   // On z9 and higher and supported Linux on z Systems platforms, all registers
@@ -480,9 +426,6 @@ class Simulator {
 
   // Debugger input.
   char* last_debugger_input_;
-
-  // Icache simulation
-  v8::internal::HashMap* i_cache_;
 
   // Registered breakpoints.
   Instruction* break_pc_;
@@ -518,6 +461,12 @@ class Simulator {
   static void EvalTableInit();
 
 #define EVALUATE(name) int Evaluate_##name(Instruction* instr)
+#define EVALUATE_VRR_INSTRUCTIONS(name, op_name, op_value) EVALUATE(op_name);
+  S390_VRR_C_OPCODE_LIST(EVALUATE_VRR_INSTRUCTIONS)
+  S390_VRR_A_OPCODE_LIST(EVALUATE_VRR_INSTRUCTIONS)
+#undef EVALUATE_VRR_INSTRUCTIONS
+
+  EVALUATE(DUMY);
   EVALUATE(BKPT);
   EVALUATE(SPM);
   EVALUATE(BALR);
@@ -605,6 +554,7 @@ class Simulator {
   EVALUATE(OI);
   EVALUATE(XI);
   EVALUATE(LM);
+  EVALUATE(CS);
   EVALUATE(MVCLE);
   EVALUATE(CLCLE);
   EVALUATE(MC);
@@ -728,6 +678,7 @@ class Simulator {
   EVALUATE(ALSIH);
   EVALUATE(ALSIHN);
   EVALUATE(CIH);
+  EVALUATE(CLIH);
   EVALUATE(STCK);
   EVALUATE(CFC);
   EVALUATE(IPM);
@@ -747,6 +698,7 @@ class Simulator {
   EVALUATE(SAR);
   EVALUATE(EAR);
   EVALUATE(MSR);
+  EVALUATE(MSRKC);
   EVALUATE(MVST);
   EVALUATE(CUSE);
   EVALUATE(SRST);
@@ -920,6 +872,7 @@ class Simulator {
   EVALUATE(ALGR);
   EVALUATE(SLGR);
   EVALUATE(MSGR);
+  EVALUATE(MSGRKC);
   EVALUATE(DSGR);
   EVALUATE(LRVGR);
   EVALUATE(LPGFR);
@@ -1059,6 +1012,7 @@ class Simulator {
   EVALUATE(BCTG);
   EVALUATE(STY);
   EVALUATE(MSY);
+  EVALUATE(MSC);
   EVALUATE(NY);
   EVALUATE(CLY);
   EVALUATE(OY);
@@ -1129,6 +1083,7 @@ class Simulator {
   EVALUATE(SRLG);
   EVALUATE(SLLG);
   EVALUATE(CSY);
+  EVALUATE(CSG);
   EVALUATE(RLLG);
   EVALUATE(RLL);
   EVALUATE(STMG);
@@ -1245,44 +1200,8 @@ class Simulator {
 #undef EVALUATE
 };
 
-// When running with the simulator transition into simulated execution at this
-// point.
-#define CALL_GENERATED_CODE(isolate, entry, p0, p1, p2, p3, p4)          \
-  reinterpret_cast<Object*>(Simulator::current(isolate)->Call(           \
-      FUNCTION_ADDR(entry), 5, (intptr_t)p0, (intptr_t)p1, (intptr_t)p2, \
-      (intptr_t)p3, (intptr_t)p4))
-
-#define CALL_GENERATED_REGEXP_CODE(isolate, entry, p0, p1, p2, p3, p4, p5, p6, \
-                                   p7, p8)                                     \
-  Simulator::current(isolate)->Call(entry, 10, (intptr_t)p0, (intptr_t)p1,     \
-                                    (intptr_t)p2, (intptr_t)p3, (intptr_t)p4,  \
-                                    (intptr_t)p5, (intptr_t)p6, (intptr_t)p7,  \
-                                    (intptr_t)NULL, (intptr_t)p8)
-
-// The simulator has its own stack. Thus it has a different stack limit from
-// the C-based native code.  The JS-based limit normally points near the end of
-// the simulator stack.  When the C-based limit is exhausted we reflect that by
-// lowering the JS-based limit as well, to make stack checks trigger.
-class SimulatorStack : public v8::internal::AllStatic {
- public:
-  static inline uintptr_t JsLimitFromCLimit(v8::internal::Isolate* isolate,
-                                            uintptr_t c_limit) {
-    return Simulator::current(isolate)->StackLimit(c_limit);
-  }
-
-  static inline uintptr_t RegisterCTryCatch(v8::internal::Isolate* isolate,
-                                            uintptr_t try_catch_address) {
-    Simulator* sim = Simulator::current(isolate);
-    return sim->PushAddress(try_catch_address);
-  }
-
-  static inline void UnregisterCTryCatch(v8::internal::Isolate* isolate) {
-    Simulator::current(isolate)->PopAddress();
-  }
-};
-
 }  // namespace internal
 }  // namespace v8
 
-#endif  // !defined(USE_SIMULATOR)
+#endif  // defined(USE_SIMULATOR)
 #endif  // V8_S390_SIMULATOR_S390_H_

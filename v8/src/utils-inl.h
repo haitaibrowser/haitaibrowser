@@ -9,6 +9,7 @@
 
 #include "include/v8-platform.h"
 #include "src/base/platform/time.h"
+#include "src/char-predicates-inl.h"
 #include "src/v8.h"
 
 namespace v8 {
@@ -30,6 +31,38 @@ class TimedScope {
   double start_;
   double* result_;
 };
+
+template <typename Char>
+bool TryAddIndexChar(uint32_t* index, Char c) {
+  if (!IsDecimalDigit(c)) return false;
+  int d = c - '0';
+  if (*index > 429496729U - ((d + 3) >> 3)) return false;
+  *index = (*index) * 10 + d;
+  return true;
+}
+
+template <typename Stream>
+bool StringToArrayIndex(Stream* stream, uint32_t* index) {
+  uint16_t ch = stream->GetNext();
+
+  // If the string begins with a '0' character, it must only consist
+  // of it to be a legal array index.
+  if (ch == '0') {
+    *index = 0;
+    return !stream->HasMore();
+  }
+
+  // Convert string to uint32 array index; character by character.
+  if (!IsDecimalDigit(ch)) return false;
+  int d = ch - '0';
+  uint32_t result = d;
+  while (stream->HasMore()) {
+    if (!TryAddIndexChar(&result, stream->GetNext())) return false;
+  }
+
+  *index = result;
+  return true;
+}
 
 }  // namespace internal
 }  // namespace v8
