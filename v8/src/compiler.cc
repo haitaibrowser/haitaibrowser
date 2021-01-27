@@ -1922,6 +1922,8 @@ MaybeHandle<SharedFunctionInfo> Compiler::GetSharedFunctionInfoForScript(
       TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
                    "V8.CompileDeserialize");
       Handle<SharedFunctionInfo> inner_result;
+      //deserialize has issue onf mips. workaround fix snapshot bug by Michael.Liu
+#if !defined(_MIPS_ARCH_MIPS64R2)     
       if (CodeSerializer::Deserialize(isolate, cached_data, source,
                                       origin_options)
               .ToHandle(&inner_result) &&
@@ -1933,7 +1935,10 @@ MaybeHandle<SharedFunctionInfo> Compiler::GetSharedFunctionInfoForScript(
                                      language_mode, inner_result);
         Handle<Script> script(Script::cast(inner_result->script()), isolate);
         maybe_result = inner_result;
-      } else {
+      } else
+#endif
+      //deserialize has issue onf mips. workaround fix snapshot bug by Michael.Liu
+      {
         // Deserializer failed. Fall through to compile.
         compile_timer.set_consuming_code_cache_failed();
       }
