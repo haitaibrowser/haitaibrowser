@@ -6,7 +6,7 @@
 
 #include <algorithm>
 #include <functional>
-#include <list>
+#include <limits>
 #include <map>
 #include <memory>
 #include <set>
@@ -14,16 +14,19 @@
 #include <vector>
 
 #include "base/bind.h"
+#include "base/bind_helpers.h"
 #include "base/compiler_specific.h"
 #include "base/files/file_enumerator.h"
-#include "base/message_loop/message_loop.h"
 #include "base/metrics/histogram_macros.h"
 #include "base/rand_util.h"
 #include "base/sequenced_task_runner.h"
+#include "base/single_thread_task_runner.h"
 #include "base/strings/string_util.h"
 #include "base/strings/utf_string_conversions.h"
 #include "base/time/time.h"
+#include "base/trace_event/trace_event.h"
 #include "build/build_config.h"
+#include "components/favicon_base/favicon_util.h"
 #include "components/favicon_base/select_favicon_frames.h"
 #include "components/history/core/browser/download_constants.h"
 #include "components/history/core/browser/download_row.h"
@@ -36,8 +39,10 @@
 #include "components/history/core/browser/in_memory_history_backend.h"
 #include "components/history/core/browser/keyword_search_term.h"
 #include "components/history/core/browser/page_usage_data.h"
-#include "components/history/core/browser/typed_url_syncable_service.h"
 #include "components/history/core/browser/url_utils.h"
+#include "components/sync/model_impl/client_tag_based_model_type_processor.h"
+#include "components/url_formatter/url_formatter.h"
+#include "net/base/escape.h"
 #include "net/base/registry_controlled_domains/registry_controlled_domain.h"
 #include "sql/error_delegate_util.h"
 #include "third_party/skia/include/core/SkBitmap.h"
@@ -52,6 +57,7 @@
 using base::Time;
 using base::TimeDelta;
 using base::TimeTicks;
+using syncer::ClientTagBasedModelTypeProcessor;
 
 /* The HistoryBackend consists of two components:
 
@@ -67,13 +73,13 @@ using base::TimeTicks;
 namespace history {
 
 namespace {
+
 void RunUnlessCanceled(
     const base::Closure& closure,
     const base::CancelableTaskTracker::IsCanceledCallback& is_canceled) {
   if (!is_canceled.Run())
     closure.Run();
 }
-}  // namespace
 
 // How long we'll wait to do a commit, so that things are batched together.
 const int kCommitIntervalSeconds = 10;
@@ -89,63 +95,42 @@ const int kMaxRedirectCount = 32;
 // and is deleted.
 const int kExpireDaysThreshold = 90;
 
-// Converts from PageUsageData to MostVisitedURL. |redirects| is a
-// list of redirects for this URL. Empty list means no redirects.
-MostVisitedURL MakeMostVisitedURL(const PageUsageData& page_data,
-                                  const RedirectList& redirects) {
-  MostVisitedURL mv;
-  mv.url = page_data.GetURL();
-  mv.title = page_data.GetTitle();
-  if (redirects.empty()) {
-    // Redirects must contain at least the target url.
-    mv.redirects.push_back(mv.url);
-  } else {
-    mv.redirects = redirects;
-    if (mv.redirects[mv.redirects.size() - 1] != mv.url) {
-      // The last url must be the target url.
-      mv.redirects.push_back(mv.url);
-    }
-  }
-  return mv;
+bool IsFaviconBitmapExpired(base::Time last_updated) {
+  return (Time::Now() - last_updated) >
+         TimeDelta::FromDays(kFaviconRefetchDays);
 }
 
-// This task is run on a timer so that commits happen at regular intervals
-// so they are batched together. The important thing about this class is that
-// it supports canceling of the task so the reference to the backend will be
-// freed. The problem is that when history is shutting down, there is likely
-// to be one of these commits still pending and holding a reference.
-//
-// The backend can call Cancel to have this task release the reference. The
-// task will still run (if we ever get to processing the event before
-// shutdown), but it will not do anything.
-//
-// Note that this is a refcounted object and is not a task in itself. It should
-// be assigned to a RunnableMethod.
-//
-// TODO(brettw): bug 1165182: This should be replaced with a
-// base::WeakPtrFactory which will handle everything automatically (like we do
-// in ExpireHistoryBackend).
-class CommitLaterTask : public base::RefCounted<CommitLaterTask> {
- public:
-  explicit CommitLaterTask(HistoryBackend* history_backend)
-      : history_backend_(history_backend) {}
+bool AreIconTypesEquivalent(favicon_base::IconType type_a,
+                            favicon_base::IconType type_b) {
+  if (type_a == type_b)
+    return true;
 
-  // The backend will call this function if it is being destroyed so that we
-  // release our reference.
-  void Cancel() { history_backend_ = nullptr; }
+  // Two icon types are considered 'equivalent' if both types are one of
+  // kTouchIcon, kTouchPrecomposedIcon or kWebManifestIcon.
+  const favicon_base::IconTypeSet equivalent_types = {
+      favicon_base::IconType::kTouchIcon,
+      favicon_base::IconType::kTouchPrecomposedIcon,
+      favicon_base::IconType::kWebManifestIcon};
 
-  void RunCommit() {
-    if (history_backend_)
-      history_backend_->Commit();
+  if (equivalent_types.count(type_a) != 0 &&
+      equivalent_types.count(type_b) != 0) {
+    return true;
   }
+  return false;
+}
 
- private:
-  friend class base::RefCounted<CommitLaterTask>;
+}  // namespace
 
-  ~CommitLaterTask() {}
-
-  scoped_refptr<HistoryBackend> history_backend_;
-};
+base::string16 FormatUrlForRedirectComparison(const GURL& url) {
+  url::Replacements<char> remove_port;
+  remove_port.ClearPort();
+  return url_formatter::FormatUrl(
+      url.ReplaceComponents(remove_port),
+      url_formatter::kFormatUrlOmitHTTP | url_formatter::kFormatUrlOmitHTTPS |
+          url_formatter::kFormatUrlOmitUsernamePassword |
+          url_formatter::kFormatUrlOmitTrivialSubdomains,
+      net::UnescapeRule::NONE, nullptr, nullptr, nullptr);
+}
 
 QueuedHistoryDBTask::QueuedHistoryDBTask(
     std::unique_ptr<HistoryDBTask> task,
@@ -162,8 +147,8 @@ QueuedHistoryDBTask::QueuedHistoryDBTask(
 QueuedHistoryDBTask::~QueuedHistoryDBTask() {
   // Ensure that |task_| is destroyed on its origin thread.
   origin_loop_->PostTask(FROM_HERE,
-                         base::Bind(&base::DeletePointer<HistoryDBTask>,
-                                    base::Unretained(task_.release())));
+                         base::BindOnce(&base::DeletePointer<HistoryDBTask>,
+                                        base::Unretained(task_.release())));
 }
 
 bool QueuedHistoryDBTask::is_canceled() {
@@ -176,10 +161,10 @@ bool QueuedHistoryDBTask::Run(HistoryBackend* backend, HistoryDatabase* db) {
 
 void QueuedHistoryDBTask::DoneRun() {
   origin_loop_->PostTask(
-      FROM_HERE, base::Bind(&RunUnlessCanceled,
-                            base::Bind(&HistoryDBTask::DoneRunOnMainThread,
-                                       base::Unretained(task_.get())),
-                            is_canceled_));
+      FROM_HERE, base::BindOnce(&RunUnlessCanceled,
+                                base::Bind(&HistoryDBTask::DoneRunOnMainThread,
+                                           base::Unretained(task_.get())),
+                                is_canceled_));
 }
 
 // HistoryBackendHelper --------------------------------------------------------
@@ -199,23 +184,34 @@ HistoryBackendHelper::~HistoryBackendHelper() {
 
 // HistoryBackend --------------------------------------------------------------
 
+// static
+bool HistoryBackend::IsTypedIncrement(ui::PageTransition transition) {
+  if (ui::PageTransitionIsNewNavigation(transition) &&
+      ((ui::PageTransitionCoreTypeIs(transition, ui::PAGE_TRANSITION_TYPED) &&
+        !ui::PageTransitionIsRedirect(transition)) ||
+       ui::PageTransitionCoreTypeIs(transition,
+                                    ui::PAGE_TRANSITION_KEYWORD_GENERATED))) {
+    return true;
+  }
+  return false;
+}
+
 HistoryBackend::HistoryBackend(
-    Delegate* delegate,
+    std::unique_ptr<Delegate> delegate,
     std::unique_ptr<HistoryBackendClient> backend_client,
     scoped_refptr<base::SequencedTaskRunner> task_runner)
-    : delegate_(delegate),
+    : delegate_(std::move(delegate)),
       scheduled_kill_db_(false),
       expirer_(this, backend_client.get(), task_runner),
       recent_redirects_(kMaxRedirectCount),
-      backend_destroy_message_loop_(nullptr),
       segment_queried_(false),
       backend_client_(std::move(backend_client)),
-      task_runner_(task_runner) {}
+      task_runner_(task_runner) {
+  DCHECK(delegate_);
+}
 
 HistoryBackend::~HistoryBackend() {
-  DCHECK(!scheduled_commit_) << "Deleting without cleanup";
-  STLDeleteContainerPointers(queued_history_db_tasks_.begin(),
-                             queued_history_db_tasks_.end());
+  DCHECK(scheduled_commit_.IsCancelled()) << "Deleting without cleanup";
   queued_history_db_tasks_.clear();
 
   // Release stashed embedder object before cleaning up the databases.
@@ -226,8 +222,8 @@ HistoryBackend::~HistoryBackend() {
 
   if (!backend_destroy_task_.is_null()) {
     // Notify an interested party (typically a unit test) that we're done.
-    DCHECK(backend_destroy_message_loop_);
-    backend_destroy_message_loop_->PostTask(FROM_HERE, backend_destroy_task_);
+    DCHECK(backend_destroy_task_runner_);
+    backend_destroy_task_runner_->PostTask(FROM_HERE, backend_destroy_task_);
   }
 
 #if defined(OS_ANDROID)
@@ -247,16 +243,23 @@ void HistoryBackend::Init(
   if (!force_fail)
     InitImpl(history_database_params);
   delegate_->DBLoaded();
-  typed_url_syncable_service_.reset(new TypedUrlSyncableService(this));
+
+  typed_url_sync_bridge_ = std::make_unique<TypedURLSyncBridge>(
+      this, db_.get(),
+      std::make_unique<ClientTagBasedModelTypeProcessor>(
+          syncer::TYPED_URLS, /*dump_stack=*/base::RepeatingClosure()));
+  typed_url_sync_bridge_->Init();
+
   memory_pressure_listener_.reset(new base::MemoryPressureListener(
       base::Bind(&HistoryBackend::OnMemoryPressure, base::Unretained(this))));
 }
 
-void HistoryBackend::SetOnBackendDestroyTask(base::MessageLoop* message_loop,
-                                             const base::Closure& task) {
+void HistoryBackend::SetOnBackendDestroyTask(
+    scoped_refptr<base::SingleThreadTaskRunner> task_runner,
+    const base::Closure& task) {
   if (!backend_destroy_task_.is_null())
     DLOG(WARNING) << "Setting more than one destroy task, overriding";
-  backend_destroy_message_loop_ = message_loop;
+  backend_destroy_task_runner_ = std::move(task_runner);
   backend_destroy_task_ = task;
 }
 
@@ -264,10 +267,6 @@ void HistoryBackend::Closing() {
   // Any scheduled commit will have a reference to us, we must make it
   // release that reference before we can be destroyed.
   CancelScheduledCommit();
-
-  // Release our reference to the delegate, this reference will be keeping the
-  // history service alive.
-  delegate_.reset();
 }
 
 #if defined(OS_IOS)
@@ -278,10 +277,6 @@ void HistoryBackend::PersistState() {
 
 void HistoryBackend::ClearCachedDataForContextID(ContextID context_id) {
   tracker_.ClearCachedDataForContextID(context_id);
-}
-
-base::FilePath HistoryBackend::GetThumbnailFileName() const {
-  return history_dir_.Append(kThumbnailsFilename);
 }
 
 base::FilePath HistoryBackend::GetFaviconsFileName() const {
@@ -325,7 +320,6 @@ SegmentID HistoryBackend::UpdateSegments(const GURL& url,
     return 0;
 
   SegmentID segment_id = 0;
-  ui::PageTransition t = ui::PageTransitionStripQualifier(transition_type);
 
   // Are we at the beginning of a new segment?
   // Note that navigating to an existing entry (with back/forward) reuses the
@@ -340,8 +334,10 @@ SegmentID HistoryBackend::UpdateSegments(const GURL& url,
   // Note also that we should still be updating the visit count for that segment
   // which we are not doing now. It should be addressed when
   // http://crbug.com/96860 is fixed.
-  if ((t == ui::PAGE_TRANSITION_TYPED ||
-       t == ui::PAGE_TRANSITION_AUTO_BOOKMARK) &&
+  if ((ui::PageTransitionCoreTypeIs(transition_type,
+                                    ui::PAGE_TRANSITION_TYPED) ||
+       ui::PageTransitionCoreTypeIs(transition_type,
+                                    ui::PAGE_TRANSITION_AUTO_BOOKMARK)) &&
       (transition_type & ui::PAGE_TRANSITION_FORWARD_BACK) == 0) {
     // If so, create or get the segment.
     std::string segment_name = db_->ComputeSegmentName(url);
@@ -410,22 +406,24 @@ void HistoryBackend::UpdateVisitDuration(VisitID visit_id, const Time end_ts) {
   }
 }
 
-TopHostsList HistoryBackend::TopHosts(size_t num_hosts) const {
-  if (!db_)
-    return TopHostsList();
+bool HistoryBackend::IsUntypedIntranetHost(const GURL& url) {
+  if (!url.SchemeIs(url::kHttpScheme) && !url.SchemeIs(url::kHttpsScheme) &&
+      !url.SchemeIs(url::kFtpScheme))
+    return false;
 
-  auto top_hosts = db_->TopHosts(num_hosts);
-
-  host_ranks_.clear();
-  int i = 0;
-  for (const auto& host_count : top_hosts)
-    host_ranks_[host_count.first] = i++;
-  return top_hosts;
+  const std::string host = url.host();
+  const size_t registry_length =
+      net::registry_controlled_domains::GetCanonicalHostRegistryLength(
+          host, net::registry_controlled_domains::EXCLUDE_UNKNOWN_REGISTRIES,
+          net::registry_controlled_domains::EXCLUDE_PRIVATE_REGISTRIES);
+  return (registry_length == 0) && !db_->IsTypedHost(host, /*scheme=*/nullptr);
 }
 
 OriginCountAndLastVisitMap HistoryBackend::GetCountsAndLastVisitForOrigins(
     const std::set<GURL>& origins) const {
   if (!db_)
+    return OriginCountAndLastVisitMap();
+  if (origins.empty())
     return OriginCountAndLastVisitMap();
 
   URLDatabase::URLEnumerator it;
@@ -451,11 +449,6 @@ OriginCountAndLastVisitMap HistoryBackend::GetCountsAndLastVisitForOrigins(
   return origin_count_map;
 }
 
-int HistoryBackend::HostRankIfAvailable(const GURL& url) const {
-  auto it = host_ranks_.find(HostForTopHosts(url));
-  return it != host_ranks_.end() ? it->second : kMaxTopHosts;
-}
-
 void HistoryBackend::AddPage(const HistoryAddPageArgs& request) {
   if (!db_)
     return;
@@ -477,34 +470,24 @@ void HistoryBackend::AddPage(const HistoryAddPageArgs& request) {
     first_recorded_time_ = request.time;
 
   ui::PageTransition request_transition = request.transition;
-  ui::PageTransition stripped_transition =
-      ui::PageTransitionStripQualifier(request_transition);
-  bool is_keyword_generated =
-      (stripped_transition == ui::PAGE_TRANSITION_KEYWORD_GENERATED);
+  bool is_keyword_generated = ui::PageTransitionCoreTypeIs(
+      request_transition, ui::PAGE_TRANSITION_KEYWORD_GENERATED);
 
   // If the user is navigating to a not-previously-typed intranet hostname,
   // change the transition to TYPED so that the omnibox will learn that this is
   // a known host.
   bool has_redirects = request.redirects.size() > 1;
   if (ui::PageTransitionIsMainFrame(request_transition) &&
-      (stripped_transition != ui::PAGE_TRANSITION_TYPED) &&
+      !ui::PageTransitionCoreTypeIs(request_transition,
+                                    ui::PAGE_TRANSITION_TYPED) &&
       !is_keyword_generated) {
-    const GURL& origin_url(has_redirects ? request.redirects[0] : request.url);
-    if (origin_url.SchemeIs(url::kHttpScheme) ||
-        origin_url.SchemeIs(url::kHttpsScheme) ||
-        origin_url.SchemeIs(url::kFtpScheme)) {
-      std::string host(origin_url.host());
-      size_t registry_length =
-          net::registry_controlled_domains::GetRegistryLength(
-              host,
-              net::registry_controlled_domains::EXCLUDE_UNKNOWN_REGISTRIES,
-              net::registry_controlled_domains::EXCLUDE_PRIVATE_REGISTRIES);
-      if (registry_length == 0 && !db_->IsTypedHost(host)) {
-        stripped_transition = ui::PAGE_TRANSITION_TYPED;
-        request_transition = ui::PageTransitionFromInt(
-            stripped_transition |
-            ui::PageTransitionGetQualifier(request_transition));
-      }
+    // Check both the start and end of a redirect chain, since the user will
+    // consider both to have been "navigated to".
+    if (IsUntypedIntranetHost(request.url) ||
+        (has_redirects && IsUntypedIntranetHost(request.redirects[0]))) {
+      request_transition = ui::PageTransitionFromInt(
+          ui::PAGE_TRANSITION_TYPED |
+          ui::PageTransitionGetQualifier(request_transition));
     }
   }
 
@@ -516,12 +499,13 @@ void HistoryBackend::AddPage(const HistoryAddPageArgs& request) {
 
     // No redirect case (one element means just the page itself).
     last_ids = AddPageVisit(request.url, request.time, last_ids.second, t,
-                            request.visit_source);
+                            request.hidden, request.visit_source,
+                            IsTypedIncrement(t), request.title);
 
     // Update the segment for this visit. KEYWORD_GENERATED visits should not
     // result in changing most visited, so we don't update segments (most
     // visited db).
-    if (!is_keyword_generated) {
+    if (!is_keyword_generated && request.consider_for_ntp_most_visited) {
       UpdateSegments(request.url, from_visit_id, last_ids.second, t,
                      request.time);
 
@@ -534,6 +518,15 @@ void HistoryBackend::AddPage(const HistoryAddPageArgs& request) {
     ui::PageTransition redirect_info = ui::PAGE_TRANSITION_CHAIN_START;
 
     RedirectList redirects = request.redirects;
+    // In the presence of client redirects, |request.redirects| can be a partial
+    // chain because previous calls to this function may have reported a
+    // redirect chain already. This is fine for the visits database where we'll
+    // just append data but insufficient for |recent_redirects_|
+    // (backpropagation of favicons and titles), where we'd like the full
+    // (extended) redirect chain. We use |extended_redirect_chain| to represent
+    // this.
+    RedirectList extended_redirect_chain;
+
     if (redirects[0].SchemeIs(url::kAboutScheme)) {
       // When the redirect source + referrer is "about" we skip it. This
       // happens when a page opens a new frame/window to about:blank and then
@@ -565,35 +558,65 @@ void HistoryBackend::AddPage(const HistoryAddPageArgs& request) {
         // can be called a lot, for example, the page cycler, and most of the
         // time we won't have changed anything.
         VisitRow visit_row;
-        if (request.did_replace_entry &&
-            db_->GetRowForVisit(last_ids.second, &visit_row) &&
-            visit_row.transition & ui::PAGE_TRANSITION_CHAIN_END) {
-          visit_row.transition = ui::PageTransitionFromInt(
-              visit_row.transition & ~ui::PAGE_TRANSITION_CHAIN_END);
-          db_->UpdateVisitRow(visit_row);
+        if (request.did_replace_entry) {
+          if (db_->GetRowForVisit(last_ids.second, &visit_row) &&
+              visit_row.transition & ui::PAGE_TRANSITION_CHAIN_END) {
+            visit_row.transition = ui::PageTransitionFromInt(
+                visit_row.transition & ~ui::PAGE_TRANSITION_CHAIN_END);
+            db_->UpdateVisitRow(visit_row);
+          }
+
+          extended_redirect_chain = GetCachedRecentRedirects(request.referrer);
         }
+      }
+    }
+
+    bool transfer_typed_credit_from_first_to_second_url = false;
+    if (redirects.size() > 1) {
+      // Check if the first redirect is the same as the original URL but
+      // upgraded to HTTPS. This ignores the port numbers (in case of
+      // non-standard HTTP or HTTPS ports) and trivial subdomains (e.g., "www."
+      // or "m.").
+      if (IsTypedIncrement(request_transition) &&
+          redirects[0].SchemeIs(url::kHttpScheme) &&
+          redirects[1].SchemeIs(url::kHttpsScheme) &&
+          FormatUrlForRedirectComparison(redirects[0]) ==
+              FormatUrlForRedirectComparison(redirects[1])) {
+        transfer_typed_credit_from_first_to_second_url = true;
       }
     }
 
     for (size_t redirect_index = 0; redirect_index < redirects.size();
          redirect_index++) {
-      ui::PageTransition t =
-          ui::PageTransitionFromInt(stripped_transition | redirect_info);
+      ui::PageTransition t = ui::PageTransitionFromInt(
+          ui::PageTransitionStripQualifier(request_transition) | redirect_info);
 
       // If this is the last transition, add a CHAIN_END marker
       if (redirect_index == (redirects.size() - 1)) {
         t = ui::PageTransitionFromInt(t | ui::PAGE_TRANSITION_CHAIN_END);
       }
 
+      bool should_increment_typed_count = IsTypedIncrement(t);
+      if (transfer_typed_credit_from_first_to_second_url) {
+        if (redirect_index == 0)
+          should_increment_typed_count = false;
+        else if (redirect_index == 1)
+          should_increment_typed_count = true;
+      }
+
       // Record all redirect visits with the same timestamp. We don't display
       // them anyway, and if we ever decide to, we can reconstruct their order
       // from the redirect chain.
-      last_ids = AddPageVisit(redirects[redirect_index], request.time,
-                              last_ids.second, t, request.visit_source);
+      last_ids =
+          AddPageVisit(redirects[redirect_index], request.time, last_ids.second,
+                       t, request.hidden, request.visit_source,
+                       should_increment_typed_count, request.title);
+
       if (t & ui::PAGE_TRANSITION_CHAIN_START) {
-        // Update the segment for this visit.
-        UpdateSegments(redirects[redirect_index], from_visit_id,
-                       last_ids.second, t, request.time);
+        if (request.consider_for_ntp_most_visited) {
+          UpdateSegments(redirects[redirect_index], from_visit_id,
+                         last_ids.second, t, request.time);
+        }
 
         // Update the visit_details for this visit.
         UpdateVisitDuration(from_visit_id, request.time);
@@ -605,8 +628,12 @@ void HistoryBackend::AddPage(const HistoryAddPageArgs& request) {
     }
 
     // Last, save this redirect chain for later so we can set titles & favicons
-    // on the redirected pages properly.
-    recent_redirects_.Put(request.url, redirects);
+    // on the redirected pages properly. For this we use the extended redirect
+    // chain, which includes URLs from chained redirects.
+    extended_redirect_chain.insert(extended_redirect_chain.end(),
+                                   std::make_move_iterator(redirects.begin()),
+                                   std::make_move_iterator(redirects.end()));
+    recent_redirects_.Put(request.url, extended_redirect_chain);
   }
 
   // TODO(brettw) bug 1140015: Add an "add page" notification so the history
@@ -616,8 +643,10 @@ void HistoryBackend::AddPage(const HistoryAddPageArgs& request) {
   // TODO(evanm): Due to http://b/1194536 we lose the referrers of a subframe
   // navigation anyway, so last_visit_id is always zero for them.  But adding
   // them here confuses main frame history, so we skip them for now.
-  if (stripped_transition != ui::PAGE_TRANSITION_AUTO_SUBFRAME &&
-      stripped_transition != ui::PAGE_TRANSITION_MANUAL_SUBFRAME &&
+  if (!ui::PageTransitionCoreTypeIs(request_transition,
+                                    ui::PAGE_TRANSITION_AUTO_SUBFRAME) &&
+      !ui::PageTransitionCoreTypeIs(request_transition,
+                                    ui::PAGE_TRANSITION_MANUAL_SUBFRAME) &&
       !is_keyword_generated) {
     tracker_.AddVisit(request.context_id, request.nav_entry_id, request.url,
                       last_ids.second);
@@ -653,14 +682,11 @@ void HistoryBackend::InitImpl(
   db_->set_error_callback(base::Bind(&HistoryBackend::DatabaseErrorCallback,
                                      base::Unretained(this)));
 
+  db_diagnostics_.clear();
   sql::InitStatus status = db_->Init(history_name);
   switch (status) {
     case sql::INIT_OK:
       break;
-    case sql::INIT_TOO_NEW:
-      delegate_->NotifyProfileError(status);
-      db_.reset();
-      return;
     case sql::INIT_FAILURE: {
       // A null db_ will cause all calls on this object to notice this error
       // and to not continue. If the error callback scheduled killing the
@@ -669,8 +695,15 @@ void HistoryBackend::InitImpl(
       bool kill_db = scheduled_kill_db_;
       if (kill_db)
         KillHistoryDatabase();
+
+      // The frequency of this UMA will indicate how often history
+      // initialization fails.
       UMA_HISTOGRAM_BOOLEAN("History.AttemptedToFixProfileError", kill_db);
-      delegate_->NotifyProfileError(status);
+      FALLTHROUGH;
+    }
+    case sql::INIT_TOO_NEW: {
+      db_diagnostics_ += sql::GetCorruptFileDiagnosticsInfo(history_name);
+      delegate_->NotifyProfileError(status, db_diagnostics_);
       db_.reset();
       return;
     }
@@ -738,19 +771,19 @@ void HistoryBackend::InitImpl(
 
 void HistoryBackend::OnMemoryPressure(
     base::MemoryPressureListener::MemoryPressureLevel memory_pressure_level) {
-  bool trim_aggressively =
-      memory_pressure_level ==
-      base::MemoryPressureListener::MEMORY_PRESSURE_LEVEL_CRITICAL;
   if (db_)
-    db_->TrimMemory(trim_aggressively);
+    db_->TrimMemory();
   if (thumbnail_db_)
-    thumbnail_db_->TrimMemory(trim_aggressively);
+    thumbnail_db_->TrimMemory();
 }
 
 void HistoryBackend::CloseAllDatabases() {
   if (db_) {
     // Commit the long-running transaction.
     db_->CommitTransaction();
+    // add by jie.zhang 20210130 for enc historyDB
+    db_->DBKeyEnc();
+    // end add by jie.zhang 20210130 for enc historyDB
     db_.reset();
     // Forget the first recorded time since the database is closed.
     first_recorded_time_ = base::Time();
@@ -761,72 +794,54 @@ void HistoryBackend::CloseAllDatabases() {
   }
 }
 
-void HistoryBackend::RecordTopHostsMetrics(const GURL& url) {
-  // Convert index from 0-based to 1-based.
-  UMA_HISTOGRAM_ENUMERATION("History.TopHostsVisitsByRank",
-                            HostRankIfAvailable(url) + 1, kMaxTopHosts + 2);
-}
-
 std::pair<URLID, VisitID> HistoryBackend::AddPageVisit(
     const GURL& url,
     Time time,
     VisitID referring_visit,
     ui::PageTransition transition,
-    VisitSource visit_source) {
-  // Top-level frame navigations are visible, everything else is hidden
-  bool new_hidden = !ui::PageTransitionIsMainFrame(transition);
-
-  // NOTE: This code must stay in sync with
-  // ExpireHistoryBackend::ExpireURLsForVisits().
-  int typed_increment = 0;
-  ui::PageTransition transition_type =
-      ui::PageTransitionStripQualifier(transition);
-  if (ui::PageTransitionIsNewNavigation(transition) &&
-      ((transition_type == ui::PAGE_TRANSITION_TYPED &&
-        !ui::PageTransitionIsRedirect(transition)) ||
-       transition_type == ui::PAGE_TRANSITION_KEYWORD_GENERATED))
-    typed_increment = 1;
-
-  if (!host_ranks_.empty() && visit_source == SOURCE_BROWSED &&
-      (transition & ui::PAGE_TRANSITION_CHAIN_END)) {
-    RecordTopHostsMetrics(url);
-  }
-
+    bool hidden,
+    VisitSource visit_source,
+    bool should_increment_typed_count,
+    base::Optional<base::string16> title) {
   // See if this URL is already in the DB.
   URLRow url_info(url);
   URLID url_id = db_->GetRowForURL(url, &url_info);
   if (url_id) {
     // Update of an existing row.
-    if (ui::PageTransitionStripQualifier(transition) !=
-        ui::PAGE_TRANSITION_RELOAD)
+    if (!ui::PageTransitionCoreTypeIs(transition, ui::PAGE_TRANSITION_RELOAD))
       url_info.set_visit_count(url_info.visit_count() + 1);
-    if (typed_increment)
-      url_info.set_typed_count(url_info.typed_count() + typed_increment);
+    if (should_increment_typed_count)
+      url_info.set_typed_count(url_info.typed_count() + 1);
     if (url_info.last_visit() < time)
       url_info.set_last_visit(time);
+    if (title)
+      url_info.set_title(title.value());
 
     // Only allow un-hiding of pages, never hiding.
-    if (!new_hidden)
+    if (!hidden)
       url_info.set_hidden(false);
 
     db_->UpdateURLRow(url_id, url_info);
   } else {
     // Addition of a new row.
     url_info.set_visit_count(1);
-    url_info.set_typed_count(typed_increment);
+    url_info.set_typed_count(should_increment_typed_count ? 1 : 0);
     url_info.set_last_visit(time);
-    url_info.set_hidden(new_hidden);
+    if (title)
+      url_info.set_title(title.value());
+    url_info.set_hidden(hidden);
 
     url_id = db_->AddURL(url_info);
     if (!url_id) {
       NOTREACHED() << "Adding URL failed.";
       return std::make_pair(0, 0);
     }
-    url_info.id_ = url_id;
+    url_info.set_id(url_id);
   }
 
   // Add the visit with the time to the database.
-  VisitRow visit_info(url_id, time, referring_visit, transition, 0);
+  VisitRow visit_info(url_id, time, referring_visit, transition, 0,
+                      should_increment_typed_count);
   VisitID visit_id = db_->AddVisit(&visit_info, visit_source);
 
   if (visit_info.visit_time < first_recorded_time_)
@@ -853,7 +868,7 @@ void HistoryBackend::AddPagesWithDetails(const URLRows& urls,
     return;
 
   URLRows changed_urls;
-  for (URLRows::const_iterator i = urls.begin(); i != urls.end(); ++i) {
+  for (auto i = urls.begin(); i != urls.end(); ++i) {
     DCHECK(!i->last_visit().is_null());
 
     // As of M37, we no longer maintain an archived database, ignore old visits.
@@ -882,7 +897,7 @@ void HistoryBackend::AddPagesWithDetails(const URLRows& urls,
           ui::PageTransitionFromInt(ui::PAGE_TRANSITION_LINK |
                                     ui::PAGE_TRANSITION_CHAIN_START |
                                     ui::PAGE_TRANSITION_CHAIN_END),
-          0);
+          0, false);
       if (!db_->AddVisit(&visit_info, visit_source)) {
         NOTREACHED() << "Adding visit failed.";
         return;
@@ -898,7 +913,7 @@ void HistoryBackend::AddPagesWithDetails(const URLRows& urls,
   //
   // TODO(brettw) bug 1140015: Add an "add page" notification so the history
   // views can keep in sync.
-  NotifyURLsModified(changed_urls);
+  NotifyURLsModified(changed_urls, /*is_from_expiration=*/false);
   ScheduleCommit();
 }
 
@@ -916,7 +931,7 @@ void HistoryBackend::SetPageTitle(const GURL& url,
   // the processing below can be the same.
   RedirectList dummy_list;
   RedirectList* redirects;
-  RedirectCache::iterator iter = recent_redirects_.Get(url);
+  auto iter = recent_redirects_.Get(url);
   if (iter != recent_redirects_.end()) {
     redirects = &iter->second;
 
@@ -944,7 +959,7 @@ void HistoryBackend::SetPageTitle(const GURL& url,
   // Broadcast notifications for any URLs that have changed. This will
   // update the in-memory database and the InMemoryURLIndex.
   if (!changed_urls.empty()) {
-    NotifyURLsModified(changed_urls);
+    NotifyURLsModified(changed_urls, /*is_from_expiration=*/false);
     ScheduleCommit();
   }
 }
@@ -975,9 +990,20 @@ void HistoryBackend::AddPageNoVisitForBookmark(const GURL& url,
 }
 
 bool HistoryBackend::GetAllTypedURLs(URLRows* urls) {
-  if (db_)
-    return db_->GetAllTypedUrls(urls);
-  return false;
+  DCHECK(urls);
+  if (!db_)
+    return false;
+  std::vector<URLID> url_ids;
+  if (!db_->GetAllURLIDsForTransition(ui::PAGE_TRANSITION_TYPED, &url_ids))
+    return false;
+  urls->reserve(url_ids.size());
+  for (const auto& url_id : url_ids) {
+    URLRow url;
+    if (!db_->GetURLRow(url_id, &url))
+      return false;
+    urls->push_back(url);
+  }
+  return true;
 }
 
 bool HistoryBackend::GetVisitsForURL(URLID id, VisitVector* visits) {
@@ -999,7 +1025,7 @@ size_t HistoryBackend::UpdateURLs(const URLRows& urls) {
     return 0;
 
   URLRows changed_urls;
-  for (URLRows::const_iterator it = urls.begin(); it != urls.end(); ++it) {
+  for (auto it = urls.begin(); it != urls.end(); ++it) {
     DCHECK(it->id());
     if (db_->UpdateURLRow(it->id(), *it))
       changed_urls.push_back(*it);
@@ -1009,7 +1035,7 @@ size_t HistoryBackend::UpdateURLs(const URLRows& urls) {
   // will update the in-memory database and the InMemoryURLIndex.
   size_t num_updated_records = changed_urls.size();
   if (num_updated_records) {
-    NotifyURLsModified(changed_urls);
+    NotifyURLsModified(changed_urls, /*is_from_expiration=*/false);
     ScheduleCommit();
   }
   return num_updated_records;
@@ -1019,9 +1045,10 @@ bool HistoryBackend::AddVisits(const GURL& url,
                                const std::vector<VisitInfo>& visits,
                                VisitSource visit_source) {
   if (db_) {
-    for (std::vector<VisitInfo>::const_iterator visit = visits.begin();
-         visit != visits.end(); ++visit) {
-      if (!AddPageVisit(url, visit->first, 0, visit->second, visit_source)
+    for (auto visit = visits.begin(); visit != visits.end(); ++visit) {
+      if (!AddPageVisit(url, visit->first, 0, visit->second,
+                        !ui::PageTransitionIsMainFrame(visit->second),
+                        visit_source, IsTypedIncrement(visit->second))
                .first) {
         return false;
       }
@@ -1056,6 +1083,12 @@ bool HistoryBackend::GetURL(const GURL& url, URLRow* url_row) {
   return false;
 }
 
+bool HistoryBackend::GetURLByID(URLID url_id, URLRow* url_row) {
+  if (db_)
+    return db_->GetURLRow(url_id, url_row);
+  return false;
+}
+
 void HistoryBackend::QueryURL(const GURL& url,
                               bool want_visits,
                               QueryURLResult* result) {
@@ -1066,19 +1099,22 @@ void HistoryBackend::QueryURL(const GURL& url,
     db_->GetVisitsForURL(result->row.id(), &result->visits);
 }
 
-TypedUrlSyncableService* HistoryBackend::GetTypedUrlSyncableService() const {
-  return typed_url_syncable_service_.get();
+base::WeakPtr<syncer::ModelTypeControllerDelegate>
+HistoryBackend::GetTypedURLSyncControllerDelegate() {
+  DCHECK(typed_url_sync_bridge_);
+  return typed_url_sync_bridge_->change_processor()->GetControllerDelegate();
 }
 
 // Statistics ------------------------------------------------------------------
 
 HistoryCountResult HistoryBackend::GetHistoryCount(const Time& begin_time,
                                                    const Time& end_time) {
-  HistoryCountResult result;
-  result.count = 0;
-  result.success =
-      db_ && db_->GetHistoryCount(begin_time, end_time, &result.count);
-  return result;
+  int count = 0;
+  return {db_ && db_->GetHistoryCount(begin_time, end_time, &count), count};
+}
+
+HistoryCountResult HistoryBackend::CountUniqueHostsVisitedLastMonth() {
+  return {!!db_, db_ ? db_->CountUniqueHostsVisitedLastMonth() : 0};
 }
 
 // Keyword visits --------------------------------------------------------------
@@ -1098,9 +1134,7 @@ void HistoryBackend::SetKeywordSearchTermsForURL(const GURL& url,
   }
 
   db_->SetKeywordSearchTermsForURL(row.id(), keyword_id, term);
-
-  if (delegate_)
-    delegate_->NotifyKeywordSearchTermUpdated(row, keyword_id, term);
+  delegate_->NotifyKeywordSearchTermUpdated(row, keyword_id, term);
 
   ScheduleCommit();
 }
@@ -1121,9 +1155,7 @@ void HistoryBackend::DeleteKeywordSearchTermForURL(const GURL& url) {
   if (!url_id)
     return;
   db_->DeleteKeywordSearchTermForURL(url_id);
-
-  if (delegate_)
-    delegate_->NotifyKeywordSearchTermDeleted(url_id);
+  delegate_->NotifyKeywordSearchTermDeleted(url_id);
 
   ScheduleCommit();
 }
@@ -1137,8 +1169,7 @@ void HistoryBackend::DeleteMatchingURLsForKeyword(KeywordID keyword_id,
   if (db_->GetKeywordSearchTermRows(term, &rows)) {
     std::vector<GURL> items_to_delete;
     URLRow row;
-    for (std::vector<KeywordSearchTermRow>::iterator it = rows.begin();
-         it != rows.end(); ++it) {
+    for (auto it = rows.begin(); it != rows.end(); ++it) {
       if ((it->keyword_id == keyword_id) && db_->GetURLRow(it->url_id, &row))
         items_to_delete.push_back(row.url());
     }
@@ -1169,18 +1200,31 @@ void HistoryBackend::QueryDownloads(std::vector<DownloadRow>* rows) {
 }
 
 // Update a particular download entry.
-void HistoryBackend::UpdateDownload(const DownloadRow& data) {
+void HistoryBackend::UpdateDownload(
+    const DownloadRow& data,
+    bool should_commit_immediately) {
   if (!db_)
     return;
   db_->UpdateDownload(data);
-  ScheduleCommit();
+  if (should_commit_immediately)
+    Commit();
+  else
+    ScheduleCommit();
 }
 
 bool HistoryBackend::CreateDownload(const DownloadRow& history_info) {
   if (!db_)
     return false;
   bool success = db_->CreateDownload(history_info);
+#if defined(OS_ANDROID)
+  // On android, browser process can get easily killed. Download will no longer
+  // be able to resume and the temporary file will linger forever if the
+  // download is not committed before that. Do the commit right away to avoid
+  // uncommitted download entry if browser is killed.
+  Commit();
+#else
   ScheduleCommit();
+#endif
   return success;
 }
 
@@ -1188,34 +1232,19 @@ void HistoryBackend::RemoveDownloads(const std::set<uint32_t>& ids) {
   if (!db_)
     return;
   size_t downloads_count_before = db_->CountDownloads();
-  base::TimeTicks started_removing = base::TimeTicks::Now();
   // HistoryBackend uses a long-running Transaction that is committed
   // periodically, so this loop doesn't actually hit the disk too hard.
-  for (std::set<uint32_t>::const_iterator it = ids.begin(); it != ids.end();
-       ++it) {
+  for (auto it = ids.begin(); it != ids.end(); ++it) {
     db_->RemoveDownload(*it);
   }
   ScheduleCommit();
-  base::TimeTicks finished_removing = base::TimeTicks::Now();
   size_t downloads_count_after = db_->CountDownloads();
 
   DCHECK_LE(downloads_count_after, downloads_count_before);
   if (downloads_count_after > downloads_count_before)
     return;
   size_t num_downloads_deleted = downloads_count_before - downloads_count_after;
-  UMA_HISTOGRAM_COUNTS("Download.DatabaseRemoveDownloadsCount",
-                       num_downloads_deleted);
-  base::TimeDelta micros = (1000 * (finished_removing - started_removing));
-  UMA_HISTOGRAM_TIMES("Download.DatabaseRemoveDownloadsTime", micros);
-  if (num_downloads_deleted > 0) {
-    UMA_HISTOGRAM_TIMES("Download.DatabaseRemoveDownloadsTimePerRecord",
-                        (1000 * micros) / num_downloads_deleted);
-  }
   DCHECK_GE(ids.size(), num_downloads_deleted);
-  if (ids.size() < num_downloads_deleted)
-    return;
-  UMA_HISTOGRAM_COUNTS("Download.DatabaseRemoveDownloadsCountNotRemoved",
-                       ids.size() - num_downloads_deleted);
 }
 
 void HistoryBackend::QueryHistory(const base::string16& text_query,
@@ -1245,6 +1274,7 @@ void HistoryBackend::QueryHistoryBasic(const QueryOptions& options,
   DCHECK_LE(static_cast<int>(visits.size()), options.EffectiveMaxCount());
 
   // Now add them and the URL rows to the results.
+  std::vector<URLResult> matching_results;
   URLResult url_result;
   for (size_t i = 0; i < visits.size(); i++) {
     const VisitRow visit = visits[i];
@@ -1270,8 +1300,9 @@ void HistoryBackend::QueryHistoryBasic(const QueryOptions& options,
 
     // We don't set any of the query-specific parts of the URLResult, since
     // snippets and stuff don't apply to basic querying.
-    result->AppendURLBySwapping(&url_result);
+    matching_results.push_back(std::move(url_result));
   }
+  result->SetURLResults(std::move(matching_results));
 
   if (!has_more_results && options.begin_time <= first_recorded_time_)
     result->set_reached_beginning(true);
@@ -1282,7 +1313,8 @@ void HistoryBackend::QueryHistoryText(const base::string16& text_query,
                                       const QueryOptions& options,
                                       QueryResults* result) {
   URLRows text_matches;
-  db_->GetTextMatches(text_query, &text_matches);
+  db_->GetTextMatchesWithAlgorithm(text_query, options.matching_algorithm,
+                                   &text_matches);
 
   std::vector<URLResult> matching_visits;
   VisitVector visits;  // Declare outside loop to prevent re-construction.
@@ -1303,13 +1335,14 @@ void HistoryBackend::QueryHistoryText(const base::string16& text_query,
   size_t max_results = options.max_count == 0
                            ? std::numeric_limits<size_t>::max()
                            : static_cast<int>(options.max_count);
-  for (std::vector<URLResult>::iterator it = matching_visits.begin();
-       it != matching_visits.end() && result->size() < max_results; ++it) {
-    result->AppendURLBySwapping(&(*it));
+  bool has_more_results = false;
+  if (matching_visits.size() > max_results) {
+    has_more_results = true;
+    matching_visits.resize(max_results);
   }
+  result->SetURLResults(std::move(matching_visits));
 
-  if (matching_visits.size() == result->size() &&
-      options.begin_time <= first_recorded_time_)
+  if (!has_more_results && options.begin_time <= first_recorded_time_)
     result->set_reached_beginning(true);
 }
 
@@ -1356,6 +1389,8 @@ void HistoryBackend::QueryMostVisitedURLs(int result_count,
   if (!db_)
     return;
 
+  base::TimeTicks begin_time = base::TimeTicks::Now();
+
   auto url_filter = backend_client_
                         ? base::Bind(&HistoryBackendClient::IsWebSafe,
                                      base::Unretained(backend_client_.get()))
@@ -1367,9 +1402,12 @@ void HistoryBackend::QueryMostVisitedURLs(int result_count,
   for (const std::unique_ptr<PageUsageData>& current_data : data) {
     RedirectList redirects;
     QueryRedirectsFrom(current_data->GetURL(), &redirects);
-    MostVisitedURL url = MakeMostVisitedURL(*current_data, redirects);
-    result->push_back(url);
+    result->emplace_back(current_data->GetURL(), current_data->GetTitle(),
+                         redirects);
   }
+
+  UMA_HISTOGRAM_TIMES("History.QueryMostVisitedURLsTime",
+                      base::TimeTicks::Now() - begin_time);
 }
 
 void HistoryBackend::GetRedirectsFromSpecificVisit(VisitID cur_visit,
@@ -1425,25 +1463,25 @@ void HistoryBackend::DeleteFTSIndexDatabases() {
   int num_databases_deleted = 0;
   base::FilePath current_file;
   while (!(current_file = enumerator.Next()).empty()) {
-    if (sql::Connection::Delete(current_file))
+    if (sql::Database::Delete(current_file))
       num_databases_deleted++;
   }
-  UMA_HISTOGRAM_COUNTS("History.DeleteFTSIndexDatabases",
-                       num_databases_deleted);
+  UMA_HISTOGRAM_COUNTS_1M("History.DeleteFTSIndexDatabases",
+                          num_databases_deleted);
 }
 
-void HistoryBackend::GetFavicons(
-    const std::vector<GURL>& icon_urls,
-    int icon_types,
+void HistoryBackend::GetFavicon(
+    const GURL& icon_url,
+    favicon_base::IconType icon_type,
     const std::vector<int>& desired_sizes,
     std::vector<favicon_base::FaviconRawBitmapResult>* bitmap_results) {
-  UpdateFaviconMappingsAndFetchImpl(nullptr, icon_urls, icon_types,
+  UpdateFaviconMappingsAndFetchImpl(base::flat_set<GURL>(), icon_url, icon_type,
                                     desired_sizes, bitmap_results);
 }
 
 void HistoryBackend::GetLargestFaviconForURL(
     const GURL& page_url,
-    const std::vector<int>& icon_types,
+    const std::vector<favicon_base::IconTypeSet>& icon_types_list,
     int minimum_size_in_pixels,
     favicon_base::FaviconRawBitmapResult* favicon_bitmap_result) {
   DCHECK(favicon_bitmap_result);
@@ -1458,18 +1496,16 @@ void HistoryBackend::GetLargestFaviconForURL(
       icon_mappings.empty())
     return;
 
-  int required_icon_types = 0;
-  for (std::vector<int>::const_iterator i = icon_types.begin();
-       i != icon_types.end(); ++i) {
-    required_icon_types |= *i;
-  }
+  favicon_base::IconTypeSet required_icon_types;
+  for (const favicon_base::IconTypeSet& icon_types : icon_types_list)
+    required_icon_types.insert(icon_types.begin(), icon_types.end());
 
   // Find the largest bitmap for each IconType placing in
   // |largest_favicon_bitmaps|.
   std::map<favicon_base::IconType, FaviconBitmap> largest_favicon_bitmaps;
   for (std::vector<IconMapping>::const_iterator i = icon_mappings.begin();
        i != icon_mappings.end(); ++i) {
-    if (!(i->icon_type & required_icon_types))
+    if (required_icon_types.count(i->icon_type) == 0)
       continue;
     std::vector<FaviconBitmapIDSize> bitmap_id_sizes;
     thumbnail_db_->GetFaviconBitmapIDSizes(i->icon_id, &bitmap_id_sizes);
@@ -1492,12 +1528,11 @@ void HistoryBackend::GetLargestFaviconForURL(
   // Find an icon which is larger than minimum_size_in_pixels in the order of
   // icon_types.
   FaviconBitmap largest_icon;
-  for (std::vector<int>::const_iterator t = icon_types.begin();
-       t != icon_types.end(); ++t) {
+  for (const favicon_base::IconTypeSet& icon_types : icon_types_list) {
     for (std::map<favicon_base::IconType, FaviconBitmap>::const_iterator f =
              largest_favicon_bitmaps.begin();
          f != largest_favicon_bitmaps.end(); ++f) {
-      if (f->first & *t &&
+      if (icon_types.count(f->first) != 0 &&
           (largest_icon.bitmap_id == 0 ||
            (largest_icon.pixel_size.height() < f->second.pixel_size.height() &&
             largest_icon.pixel_size.width() < f->second.pixel_size.width()))) {
@@ -1517,18 +1552,18 @@ void HistoryBackend::GetLargestFaviconForURL(
   }
 
   base::Time last_updated;
+  base::Time last_requested;
   favicon_base::FaviconRawBitmapResult bitmap_result;
   bitmap_result.icon_url = icon_url;
   bitmap_result.icon_type = icon_type;
-  if (!thumbnail_db_->GetFaviconBitmap(largest_icon.bitmap_id,
-                                       &last_updated, nullptr,
-                                       &bitmap_result.bitmap_data,
-                                       &bitmap_result.pixel_size)) {
+  if (!thumbnail_db_->GetFaviconBitmap(
+          largest_icon.bitmap_id, &last_updated, &last_requested,
+          &bitmap_result.bitmap_data, &bitmap_result.pixel_size)) {
     return;
   }
 
-  bitmap_result.expired =
-      (Time::Now() - last_updated) > TimeDelta::FromDays(kFaviconRefetchDays);
+  bitmap_result.expired = IsFaviconBitmapExpired(last_updated);
+  bitmap_result.fetched_because_of_page_visit = last_requested.is_null();
   if (bitmap_result.is_valid())
     *favicon_bitmap_result = bitmap_result;
 
@@ -1538,17 +1573,25 @@ void HistoryBackend::GetLargestFaviconForURL(
 
 void HistoryBackend::GetFaviconsForURL(
     const GURL& page_url,
-    int icon_types,
+    const favicon_base::IconTypeSet& icon_types,
     const std::vector<int>& desired_sizes,
+    bool fallback_to_host,
     std::vector<favicon_base::FaviconRawBitmapResult>* bitmap_results) {
+  TRACE_EVENT0("browser", "HistoryBackend::GetFaviconsForURL");
   DCHECK(bitmap_results);
-  GetFaviconsFromDB(page_url, icon_types, desired_sizes, bitmap_results);
+  GetFaviconsFromDB(page_url, icon_types, desired_sizes, fallback_to_host,
+                    bitmap_results);
+
+  if (desired_sizes.size() == 1)
+    bitmap_results->assign(1, favicon_base::ResizeFaviconBitmapResult(
+                                  *bitmap_results, desired_sizes[0]));
 }
 
 void HistoryBackend::GetFaviconForID(
     favicon_base::FaviconID favicon_id,
     int desired_size,
     std::vector<favicon_base::FaviconRawBitmapResult>* bitmap_results) {
+  TRACE_EVENT0("browser", "HistoryBackend::GetFaviconForID");
   std::vector<favicon_base::FaviconID> favicon_ids;
   favicon_ids.push_back(favicon_id);
   std::vector<int> desired_sizes;
@@ -1557,16 +1600,37 @@ void HistoryBackend::GetFaviconForID(
   // Get results from DB.
   GetFaviconBitmapResultsForBestMatch(favicon_ids, desired_sizes,
                                       bitmap_results);
+
+  bitmap_results->assign(1, favicon_base::ResizeFaviconBitmapResult(
+                                *bitmap_results, desired_size));
 }
 
 void HistoryBackend::UpdateFaviconMappingsAndFetch(
-    const GURL& page_url,
-    const std::vector<GURL>& icon_urls,
-    int icon_types,
+    const base::flat_set<GURL>& page_urls,
+    const GURL& icon_url,
+    favicon_base::IconType icon_type,
     const std::vector<int>& desired_sizes,
     std::vector<favicon_base::FaviconRawBitmapResult>* bitmap_results) {
-  UpdateFaviconMappingsAndFetchImpl(&page_url, icon_urls, icon_types,
+  UpdateFaviconMappingsAndFetchImpl(page_urls, icon_url, icon_type,
                                     desired_sizes, bitmap_results);
+}
+
+void HistoryBackend::DeleteFaviconMappings(
+    const base::flat_set<GURL>& page_urls,
+    favicon_base::IconType icon_type) {
+  if (!thumbnail_db_ || !db_)
+    return;
+
+  for (const GURL& page_url : page_urls) {
+    bool mapping_changed = SetFaviconMappingsForPageAndRedirects(
+        page_url, icon_type, /*icon_id=*/0);
+
+    if (mapping_changed) {
+      // Notify the UI that this function changed an icon mapping.
+      SendFaviconChangedNotificationForPageAndRedirects(page_url);
+      ScheduleCommit();
+    }
+  }
 }
 
 void HistoryBackend::MergeFavicon(
@@ -1579,13 +1643,11 @@ void HistoryBackend::MergeFavicon(
     return;
 
   favicon_base::FaviconID favicon_id =
-      thumbnail_db_->GetFaviconIDForFaviconURL(icon_url, icon_type, nullptr);
+      thumbnail_db_->GetFaviconIDForFaviconURL(icon_url, icon_type);
 
-  bool favicon_created = false;
   if (!favicon_id) {
     // There is no favicon at |icon_url|, create it.
     favicon_id = thumbnail_db_->AddFavicon(icon_url, icon_type);
-    favicon_created = true;
   }
 
   std::vector<FaviconBitmapIDSize> bitmap_id_sizes;
@@ -1601,7 +1663,7 @@ void HistoryBackend::MergeFavicon(
         // Sync calls MergeFavicon() for all of the favicons that it manages at
         // startup. Do not update the "last updated" time if the favicon bitmap
         // data matches that in the database.
-        // TODO: Pass in boolean to MergeFavicon() if any users of
+        // TODO(pkotwicz): Pass in boolean to MergeFavicon() if any users of
         // MergeFavicon() want the last_updated time to be updated when the new
         // bitmap data is identical to the old.
         bitmap_identical = true;
@@ -1609,7 +1671,8 @@ void HistoryBackend::MergeFavicon(
         // Expire the favicon bitmap because sync can provide incorrect
         // |bitmap_data|. See crbug.com/474421 for more details. Expiring the
         // favicon bitmap causes it to be redownloaded the next time that the
-        // user visits any page which uses |icon_url|.
+        // user visits any page which uses |icon_url|. It also allows storing an
+        // on-demand icon along with the icon from sync.
         thumbnail_db_->SetFaviconBitmap(bitmap_id_sizes[i].bitmap_id,
                                         bitmap_data, base::Time());
         replaced_bitmap = true;
@@ -1635,7 +1698,13 @@ void HistoryBackend::MergeFavicon(
       thumbnail_db_->DeleteFaviconBitmap(bitmap_id_sizes[0].bitmap_id);
       favicon_sizes.erase(favicon_sizes.begin());
     }
-    thumbnail_db_->AddFaviconBitmap(favicon_id, bitmap_data, base::Time::Now(),
+    // Set the new bitmap as expired because the bitmaps from sync/profile
+    // import/etc. are not authoritative. Expiring the favicon bitmap causes the
+    // bitmaps to be redownloaded the next time that the user visits any page
+    // which uses |icon_url|. It also allows storing an on-demand icon along
+    // with the icon from sync.
+    thumbnail_db_->AddFaviconBitmap(favicon_id, bitmap_data,
+                                    FaviconBitmapType::ON_VISIT, base::Time(),
                                     pixel_size);
     favicon_sizes.push_back(pixel_size);
   }
@@ -1669,7 +1738,8 @@ void HistoryBackend::MergeFavicon(
   //               modified.
 
   std::vector<IconMapping> icon_mappings;
-  thumbnail_db_->GetIconMappingsForPageURL(page_url, icon_type, &icon_mappings);
+  thumbnail_db_->GetIconMappingsForPageURL(page_url, {icon_type},
+                                           &icon_mappings);
 
   // Copy the favicon bitmaps mapped to |page_url| to the favicon at |icon_url|
   // till the limit of |kMaxFaviconBitmapsPerIconURL| is reached.
@@ -1689,17 +1759,15 @@ void HistoryBackend::MergeFavicon(
       // a favicon bitmap mapped to |icon_url|. The one there is more correct
       // and having multiple equally sized favicon bitmaps for |page_url| is
       // ambiguous in terms of GetFaviconsForURL().
-      std::vector<gfx::Size>::iterator it =
-          std::find(favicon_sizes.begin(), favicon_sizes.end(),
-                    bitmaps_to_copy[j].pixel_size);
-      if (it != favicon_sizes.end())
+      if (base::ContainsValue(favicon_sizes, bitmaps_to_copy[j].pixel_size))
         continue;
 
       // Add the favicon bitmap as expired as it is not consistent with the
       // merged in data.
-      thumbnail_db_->AddFaviconBitmap(
-          favicon_id, bitmaps_to_copy[j].bitmap_data, base::Time(),
-          bitmaps_to_copy[j].pixel_size);
+      thumbnail_db_->AddFaviconBitmap(favicon_id,
+                                      bitmaps_to_copy[j].bitmap_data,
+                                      FaviconBitmapType::ON_VISIT, base::Time(),
+                                      bitmaps_to_copy[j].pixel_size);
       favicon_sizes.push_back(bitmaps_to_copy[j].pixel_size);
       favicon_bitmaps_copied = true;
 
@@ -1711,15 +1779,11 @@ void HistoryBackend::MergeFavicon(
   // Update the favicon mappings such that only |icon_url| is mapped to
   // |page_url|.
   if (icon_mappings.size() != 1 || icon_mappings[0].icon_url != icon_url) {
-    std::vector<favicon_base::FaviconID> favicon_ids;
-    favicon_ids.push_back(favicon_id);
-    SetFaviconMappingsForPageAndRedirects(page_url, icon_type, favicon_ids);
+    SetFaviconMappingsForPageAndRedirects(page_url, icon_type, favicon_id);
     SendFaviconChangedNotificationForPageAndRedirects(page_url);
   }
 
-  if (!favicon_created && (!bitmap_identical || favicon_bitmaps_copied)) {
-    // If there was a favicon at |icon_url| prior to MergeFavicon() being
-    // called, there may be page URLs which also use the favicon at |icon_url|.
+  if (!bitmap_identical || favicon_bitmaps_copied) {
     // Notify the UI that the favicon has changed for |icon_url|.
     SendFaviconChangedNotificationForIconURL(icon_url);
   }
@@ -1727,42 +1791,93 @@ void HistoryBackend::MergeFavicon(
   ScheduleCommit();
 }
 
-void HistoryBackend::SetFavicons(const GURL& page_url,
+void HistoryBackend::SetFavicons(const base::flat_set<GURL>& page_urls,
                                  favicon_base::IconType icon_type,
                                  const GURL& icon_url,
                                  const std::vector<SkBitmap>& bitmaps) {
-  if (!thumbnail_db_ || !db_)
+  SetFaviconsImpl(page_urls, icon_type, icon_url, bitmaps,
+                  FaviconBitmapType::ON_VISIT);
+}
+
+void HistoryBackend::CloneFaviconMappingsForPages(
+    const GURL& page_url_to_read,
+    const favicon_base::IconTypeSet& icon_types,
+    const base::flat_set<GURL>& page_urls_to_write) {
+  if (!db_ || !thumbnail_db_)
     return;
 
-  DCHECK_GE(kMaxFaviconBitmapsPerIconURL, bitmaps.size());
-
-  favicon_base::FaviconID icon_id =
-      thumbnail_db_->GetFaviconIDForFaviconURL(icon_url, icon_type, nullptr);
-
-  bool favicon_created = false;
-  if (!icon_id) {
-    icon_id = thumbnail_db_->AddFavicon(icon_url, icon_type);
-    favicon_created = true;
+  // Update mappings including redirects for each entry in |page_urls_to_write|.
+  base::flat_set<GURL> page_urls_to_update_mappings;
+  for (const GURL& update_mappings_for_page : page_urls_to_write) {
+    RedirectList redirects = GetCachedRecentRedirects(update_mappings_for_page);
+    page_urls_to_update_mappings.insert(redirects.begin(), redirects.end());
   }
 
-  bool favicon_data_modified = SetFaviconBitmaps(icon_id, bitmaps);
+  // No need to update mapping for |page_url_to_read|, because this is where
+  // we're getting the mappings from.
+  page_urls_to_update_mappings.erase(page_url_to_read);
 
-  std::vector<favicon_base::FaviconID> icon_ids(1u, icon_id);
-  bool mapping_changed =
-      SetFaviconMappingsForPageAndRedirects(page_url, icon_type, icon_ids);
+  if (page_urls_to_update_mappings.empty())
+    return;
 
-  if (mapping_changed) {
-    // Notify the UI that this function changed an icon mapping.
-    SendFaviconChangedNotificationForPageAndRedirects(page_url);
+  // Get FaviconIDs for |page_url_to_read| and one of |icon_types|.
+  std::vector<IconMapping> icon_mappings;
+  thumbnail_db_->GetIconMappingsForPageURL(page_url_to_read, icon_types,
+                                           &icon_mappings);
+  if (icon_mappings.empty())
+    return;
+
+  std::set<GURL> changed_page_urls;
+  for (const IconMapping& icon_mapping : icon_mappings) {
+    std::vector<GURL> v = SetFaviconMappingsForPages(
+        page_urls_to_update_mappings, icon_mapping.icon_type,
+        icon_mapping.icon_id);
+    changed_page_urls.insert(std::make_move_iterator(v.begin()),
+                             std::make_move_iterator(v.end()));
   }
 
-  if (favicon_data_modified && !favicon_created) {
-    // If there was a favicon at |icon_url| prior to SetFavicons() being called,
-    // there may be page URLs which also use the favicon at |icon_url|. Notify
-    // the UI that the favicon has changed for |icon_url|.
-    SendFaviconChangedNotificationForIconURL(icon_url);
+  if (!changed_page_urls.empty()) {
+    NotifyFaviconsChanged(changed_page_urls, GURL());
+    ScheduleCommit();
   }
-  ScheduleCommit();
+}
+
+bool HistoryBackend::CanSetOnDemandFavicons(const GURL& page_url,
+                                            favicon_base::IconType icon_type) {
+  if (!thumbnail_db_ || !db_)
+    return false;
+
+  // We allow writing an on demand favicon of type |icon_type| only if there is
+  // no icon of such type in the DB (so that we never overwrite anything) and if
+  // all other icons are expired. This in particular allows writing an on-demand
+  // icon if there is only an icon from sync (icons from sync are immediately
+  // set as expired).
+  std::vector<IconMapping> mapping_data;
+  thumbnail_db_->GetIconMappingsForPageURL(page_url, &mapping_data);
+
+  for (const IconMapping& mapping : mapping_data) {
+    if (AreIconTypesEquivalent(mapping.icon_type, icon_type))
+      return false;
+
+    base::Time last_updated;
+    if (thumbnail_db_->GetFaviconLastUpdatedTime(mapping.icon_id,
+                                                 &last_updated) &&
+        !IsFaviconBitmapExpired(last_updated)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool HistoryBackend::SetOnDemandFavicons(const GURL& page_url,
+                                         favicon_base::IconType icon_type,
+                                         const GURL& icon_url,
+                                         const std::vector<SkBitmap>& bitmaps) {
+  if (!CanSetOnDemandFavicons(page_url, icon_type))
+    return false;
+
+  return SetFaviconsImpl({page_url}, icon_type, icon_url, bitmaps,
+                         FaviconBitmapType::ON_DEMAND);
 }
 
 void HistoryBackend::SetFaviconsOutOfDateForPage(const GURL& page_url) {
@@ -1772,10 +1887,17 @@ void HistoryBackend::SetFaviconsOutOfDateForPage(const GURL& page_url) {
       !thumbnail_db_->GetIconMappingsForPageURL(page_url, &icon_mappings))
     return;
 
-  for (std::vector<IconMapping>::iterator m = icon_mappings.begin();
-       m != icon_mappings.end(); ++m) {
+  for (auto m = icon_mappings.begin(); m != icon_mappings.end(); ++m) {
     thumbnail_db_->SetFaviconOutOfDate(m->icon_id);
   }
+  ScheduleCommit();
+}
+
+void HistoryBackend::TouchOnDemandFavicon(const GURL& icon_url) {
+  if (!thumbnail_db_)
+    return;
+
+  thumbnail_db_->TouchOnDemandFavicon(icon_url, Time::Now());
   ScheduleCommit();
 }
 
@@ -1792,18 +1914,18 @@ void HistoryBackend::SetImportedFavicons(
   for (size_t i = 0; i < favicon_usage.size(); i++) {
     favicon_base::FaviconID favicon_id =
         thumbnail_db_->GetFaviconIDForFaviconURL(
-            favicon_usage[i].favicon_url, favicon_base::FAVICON, nullptr);
+            favicon_usage[i].favicon_url, favicon_base::IconType::kFavicon);
     if (!favicon_id) {
       // This favicon doesn't exist yet, so we create it using the given data.
       // TODO(pkotwicz): Pass in real pixel size.
       favicon_id = thumbnail_db_->AddFavicon(
-          favicon_usage[i].favicon_url, favicon_base::FAVICON,
-          new base::RefCountedBytes(favicon_usage[i].png_data), now,
-          gfx::Size());
+          favicon_usage[i].favicon_url, favicon_base::IconType::kFavicon,
+          new base::RefCountedBytes(favicon_usage[i].png_data),
+          FaviconBitmapType::ON_VISIT, now, gfx::Size());
     }
 
     // Save the mapping from all the URLs to the favicon.
-    for (std::set<GURL>::const_iterator url = favicon_usage[i].urls.begin();
+    for (auto url = favicon_usage[i].urls.begin();
          url != favicon_usage[i].urls.end(); ++url) {
       URLRow url_row;
       if (!db_->GetRowForURL(*url, &url_row)) {
@@ -1811,8 +1933,9 @@ void HistoryBackend::SetImportedFavicons(
         // save the favicon mapping. This will match with what history db does
         // for regular bookmarked URLs with favicons - when history db is
         // cleaned, we keep an entry in the db with 0 visits as long as that
-        // url is bookmarked.
-        if (backend_client_ && backend_client_->IsBookmarked(*url)) {
+        // url is bookmarked. The same is applicable to the saved credential's
+        // URLs.
+        if (backend_client_ && backend_client_->IsPinnedURL(*url)) {
           URLRow url_info(*url);
           url_info.set_visit_count(0);
           url_info.set_typed_count(0);
@@ -1824,7 +1947,8 @@ void HistoryBackend::SetImportedFavicons(
         }
       } else {
         if (!thumbnail_db_->GetIconMappingsForPageURL(
-                *url, favicon_base::FAVICON, nullptr)) {
+                *url, {favicon_base::IconType::kFavicon},
+                /*mapping_data=*/nullptr)) {
           // URL is present in history, update the favicon *only* if it is not
           // set already.
           thumbnail_db_->AddIconMapping(*url, favicon_id);
@@ -1840,71 +1964,87 @@ void HistoryBackend::SetImportedFavicons(
   }
 }
 
-void HistoryBackend::UpdateFaviconMappingsAndFetchImpl(
-    const GURL* page_url,
-    const std::vector<GURL>& icon_urls,
-    int icon_types,
-    const std::vector<int>& desired_sizes,
-    std::vector<favicon_base::FaviconRawBitmapResult>* bitmap_results) {
-  // If |page_url| is specified, |icon_types| must be either a single icon
-  // type or icon types which are equivalent.
-  DCHECK(!page_url || icon_types == favicon_base::FAVICON ||
-         icon_types == favicon_base::TOUCH_ICON ||
-         icon_types == favicon_base::TOUCH_PRECOMPOSED_ICON ||
-         icon_types ==
-             (favicon_base::TOUCH_ICON | favicon_base::TOUCH_PRECOMPOSED_ICON));
-  bitmap_results->clear();
+bool HistoryBackend::SetFaviconsImpl(const base::flat_set<GURL>& page_urls,
+                                     favicon_base::IconType icon_type,
+                                     const GURL& icon_url,
+                                     const std::vector<SkBitmap>& bitmaps,
+                                     FaviconBitmapType type) {
+  DCHECK(!page_urls.empty());
 
-  if (!thumbnail_db_) {
-    return;
+  if (!thumbnail_db_ || !db_)
+    return false;
+
+  DCHECK_GE(kMaxFaviconBitmapsPerIconURL, bitmaps.size());
+
+  favicon_base::FaviconID icon_id =
+      thumbnail_db_->GetFaviconIDForFaviconURL(icon_url, icon_type);
+
+  bool favicon_created = false;
+  if (!icon_id) {
+    icon_id = thumbnail_db_->AddFavicon(icon_url, icon_type);
+    favicon_created = true;
   }
 
-  std::vector<favicon_base::FaviconID> favicon_ids;
+  bool favicon_data_modified = false;
+  if (favicon_created || type == FaviconBitmapType::ON_VISIT) {
+    favicon_data_modified = SetFaviconBitmaps(icon_id, bitmaps, type);
+  }
 
-  // The icon type for which the mappings will the updated and data will be
-  // returned.
-  favicon_base::IconType selected_icon_type = favicon_base::INVALID_ICON;
+  for (const GURL& page_url : page_urls) {
+    bool mapping_changed =
+        SetFaviconMappingsForPageAndRedirects(page_url, icon_type, icon_id);
 
-  for (size_t i = 0; i < icon_urls.size(); ++i) {
-    const GURL& icon_url = icon_urls[i];
-    favicon_base::IconType icon_type_out;
-    const favicon_base::FaviconID favicon_id =
-        thumbnail_db_->GetFaviconIDForFaviconURL(icon_url, icon_types,
-                                                 &icon_type_out);
-
-    if (favicon_id) {
-      // Return and update icon mappings only for the largest icon type. As
-      // |icon_urls| is not sorted in terms of icon type, clear |favicon_ids|
-      // if an |icon_url| with a larger icon type is found.
-      if (icon_type_out > selected_icon_type) {
-        selected_icon_type = icon_type_out;
-        favicon_ids.clear();
-      }
-      if (icon_type_out == selected_icon_type)
-        favicon_ids.push_back(favicon_id);
+    if (mapping_changed) {
+      // Notify the UI that this function changed an icon mapping.
+      SendFaviconChangedNotificationForPageAndRedirects(page_url);
     }
   }
 
-  if (page_url && !favicon_ids.empty()) {
-    bool mappings_updated = SetFaviconMappingsForPageAndRedirects(
-        *page_url, selected_icon_type, favicon_ids);
+  if (favicon_data_modified) {
+    // Notify the UI that the favicon has changed for |icon_url|.
+    SendFaviconChangedNotificationForIconURL(icon_url);
+  }
+  ScheduleCommit();
+  return favicon_data_modified;
+}
+
+void HistoryBackend::UpdateFaviconMappingsAndFetchImpl(
+    const base::flat_set<GURL>& page_urls,
+    const GURL& icon_url,
+    favicon_base::IconType icon_type,
+    const std::vector<int>& desired_sizes,
+    std::vector<favicon_base::FaviconRawBitmapResult>* bitmap_results) {
+  bitmap_results->clear();
+
+  if (!thumbnail_db_)
+    return;
+
+  const favicon_base::FaviconID favicon_id =
+      thumbnail_db_->GetFaviconIDForFaviconURL(icon_url, icon_type);
+  if (!favicon_id)
+    return;
+
+  for (const GURL& page_url : page_urls) {
+    bool mappings_updated =
+        SetFaviconMappingsForPageAndRedirects(page_url, icon_type, favicon_id);
     if (mappings_updated) {
-      SendFaviconChangedNotificationForPageAndRedirects(*page_url);
+      SendFaviconChangedNotificationForPageAndRedirects(page_url);
       ScheduleCommit();
     }
   }
 
-  GetFaviconBitmapResultsForBestMatch(favicon_ids, desired_sizes,
+  GetFaviconBitmapResultsForBestMatch({favicon_id}, desired_sizes,
                                       bitmap_results);
 }
 
 bool HistoryBackend::SetFaviconBitmaps(favicon_base::FaviconID icon_id,
-                                       const std::vector<SkBitmap>& bitmaps) {
+                                       const std::vector<SkBitmap>& bitmaps,
+                                       FaviconBitmapType type) {
   std::vector<FaviconBitmapIDSize> bitmap_id_sizes;
   thumbnail_db_->GetFaviconBitmapIDSizes(icon_id, &bitmap_id_sizes);
 
-  typedef std::pair<scoped_refptr<base::RefCountedBytes>, gfx::Size>
-      PNGEncodedBitmap;
+  using PNGEncodedBitmap =
+      std::pair<scoped_refptr<base::RefCountedBytes>, gfx::Size>;
   std::vector<PNGEncodedBitmap> to_add;
   for (size_t i = 0; i < bitmaps.size(); ++i) {
     scoped_refptr<base::RefCountedBytes> bitmap_data(new base::RefCountedBytes);
@@ -1919,9 +2059,8 @@ bool HistoryBackend::SetFaviconBitmaps(favicon_base::FaviconID icon_id,
   bool favicon_bitmaps_changed = false;
   for (size_t i = 0; i < bitmap_id_sizes.size(); ++i) {
     const gfx::Size& pixel_size = bitmap_id_sizes[i].pixel_size;
-    std::vector<PNGEncodedBitmap>::iterator match_it = to_add.end();
-    for (std::vector<PNGEncodedBitmap>::iterator it = to_add.begin();
-         it != to_add.end(); ++it) {
+    auto match_it = to_add.end();
+    for (auto it = to_add.begin(); it != to_add.end(); ++it) {
       if (it->second == pixel_size) {
         match_it = it;
         break;
@@ -1936,11 +2075,12 @@ bool HistoryBackend::SetFaviconBitmaps(favicon_base::FaviconID icon_id,
     } else {
       if (!favicon_bitmaps_changed &&
           IsFaviconBitmapDataEqual(bitmap_id, match_it->first)) {
-        thumbnail_db_->SetFaviconBitmapLastUpdateTime(bitmap_id,
-                                                      base::Time::Now());
+        thumbnail_db_->SetFaviconBitmapLastUpdateTime(
+            bitmap_id, base::Time::Now() /* new last updated time */);
       } else {
-        thumbnail_db_->SetFaviconBitmap(bitmap_id, match_it->first,
-                                        base::Time::Now());
+        thumbnail_db_->SetFaviconBitmap(
+            bitmap_id, match_it->first,
+            base::Time::Now() /* new last updated time */);
         favicon_bitmaps_changed = true;
       }
       to_add.erase(match_it);
@@ -1948,8 +2088,10 @@ bool HistoryBackend::SetFaviconBitmaps(favicon_base::FaviconID icon_id,
   }
 
   for (size_t i = 0; i < to_add.size(); ++i) {
-    thumbnail_db_->AddFaviconBitmap(icon_id, to_add[i].first, base::Time::Now(),
-                                    to_add[i].second);
+    thumbnail_db_->AddFaviconBitmap(
+        icon_id, to_add[i].first, type,
+        base::Time::Now() /* new last updated / last requested time */,
+        to_add[i].second);
 
     favicon_bitmaps_changed = true;
   }
@@ -1970,8 +2112,9 @@ bool HistoryBackend::IsFaviconBitmapDataEqual(
 
 bool HistoryBackend::GetFaviconsFromDB(
     const GURL& page_url,
-    int icon_types,
+    const favicon_base::IconTypeSet& icon_types,
     const std::vector<int>& desired_sizes,
+    bool fallback_to_host,
     std::vector<favicon_base::FaviconRawBitmapResult>* favicon_bitmap_results) {
   DCHECK(favicon_bitmap_results);
   favicon_bitmap_results->clear();
@@ -1986,6 +2129,22 @@ bool HistoryBackend::GetFaviconsFromDB(
   std::vector<IconMapping> icon_mappings;
   thumbnail_db_->GetIconMappingsForPageURL(page_url, icon_types,
                                            &icon_mappings);
+
+  if (icon_mappings.empty() && fallback_to_host &&
+      page_url.SchemeIsHTTPOrHTTPS()) {
+    // We didn't find any matches, and the caller requested falling back to the
+    // host of |page_url| for fuzzy matching. Query the database for a page_url
+    // that is known to exist and matches the host of |page_url|. Do this only
+    // if we have a HTTP/HTTPS url.
+    base::Optional<GURL> fallback_page_url =
+        thumbnail_db_->FindFirstPageURLForHost(page_url, icon_types);
+
+    if (fallback_page_url) {
+      thumbnail_db_->GetIconMappingsForPageURL(fallback_page_url.value(),
+                                               icon_types, &icon_mappings);
+    }
+  }
+
   std::vector<favicon_base::FaviconID> favicon_ids;
   for (size_t i = 0; i < icon_mappings.size(); ++i)
     favicon_ids.push_back(icon_mappings[i].icon_id);
@@ -2030,7 +2189,8 @@ bool HistoryBackend::GetFaviconBitmapResultsForBestMatch(
                               &score);
     if (score > highest_score) {
       highest_score = score;
-      best_favicon_id = candidate_favicon_ids[i], best_bitmap_ids.clear();
+      best_favicon_id = candidate_favicon_ids[i];
+      best_bitmap_ids.clear();
       for (size_t j = 0; j < candidate_bitmap_indices.size(); ++j) {
         size_t candidate_index = candidate_bitmap_indices[j];
         best_bitmap_ids.push_back(bitmap_id_sizes[candidate_index].bitmap_id);
@@ -2049,17 +2209,19 @@ bool HistoryBackend::GetFaviconBitmapResultsForBestMatch(
 
   for (size_t i = 0; i < best_bitmap_ids.size(); ++i) {
     base::Time last_updated;
+    base::Time last_requested;
     favicon_base::FaviconRawBitmapResult bitmap_result;
     bitmap_result.icon_url = icon_url;
     bitmap_result.icon_type = icon_type;
-    if (!thumbnail_db_->GetFaviconBitmap(best_bitmap_ids[i], &last_updated,
-                                         nullptr, &bitmap_result.bitmap_data,
-                                         &bitmap_result.pixel_size)) {
+    if (!thumbnail_db_->GetFaviconBitmap(
+            best_bitmap_ids[i], &last_updated, &last_requested,
+            &bitmap_result.bitmap_data, &bitmap_result.pixel_size)) {
       return false;
     }
 
     bitmap_result.expired =
         (Time::Now() - last_updated) > TimeDelta::FromDays(kFaviconRefetchDays);
+    bitmap_result.fetched_because_of_page_visit = last_requested.is_null();
     if (bitmap_result.is_valid())
       favicon_bitmap_results->push_back(bitmap_result);
   }
@@ -2069,79 +2231,56 @@ bool HistoryBackend::GetFaviconBitmapResultsForBestMatch(
 bool HistoryBackend::SetFaviconMappingsForPageAndRedirects(
     const GURL& page_url,
     favicon_base::IconType icon_type,
-    const std::vector<favicon_base::FaviconID>& icon_ids) {
+    favicon_base::FaviconID icon_id) {
   if (!thumbnail_db_)
     return false;
 
   // Find all the pages whose favicons we should set, we want to set it for
   // all the pages in the redirect chain if it redirected.
-  RedirectList redirects;
-  GetCachedRecentRedirects(page_url, &redirects);
-  bool mappings_changed = SetFaviconMappingsForPages(redirects, icon_type,
-                                                     icon_ids);
-  if (page_url.has_ref()) {
-    // Refs often gets added by Javascript, but the redirect chain is keyed to
-    // the URL without a ref.
-    GURL::Replacements replacements;
-    replacements.ClearRef();
-    GURL page_url_without_ref = page_url.ReplaceComponents(replacements);
-    GetCachedRecentRedirects(page_url_without_ref, &redirects);
-    mappings_changed |= SetFaviconMappingsForPages(redirects, icon_type,
-                                                   icon_ids);
-  }
-
+  RedirectList redirects = GetCachedRecentRedirects(page_url);
+  bool mappings_changed =
+      !SetFaviconMappingsForPages(base::flat_set<GURL>(redirects), icon_type,
+                                  icon_id)
+           .empty();
   return mappings_changed;
 }
 
-bool HistoryBackend::SetFaviconMappingsForPages(
-    const std::vector<GURL>& page_urls,
+std::vector<GURL> HistoryBackend::SetFaviconMappingsForPages(
+    const base::flat_set<GURL>& page_urls,
     favicon_base::IconType icon_type,
-    const std::vector<favicon_base::FaviconID>& icon_ids) {
-  bool mappings_changed = false;
-  for (auto i(page_urls.begin()); i != page_urls.end(); ++i) {
-    mappings_changed |= SetFaviconMappingsForPage(*i, icon_type, icon_ids);
+    favicon_base::FaviconID icon_id) {
+  std::vector<GURL> changed_page_urls;
+  for (const GURL& page_url : page_urls) {
+    if (SetFaviconMappingsForPage(page_url, icon_type, icon_id))
+      changed_page_urls.push_back(page_url);
   }
-  return mappings_changed;
+  return changed_page_urls;
 }
 
 bool HistoryBackend::SetFaviconMappingsForPage(
     const GURL& page_url,
     favicon_base::IconType icon_type,
-    const std::vector<favicon_base::FaviconID>& icon_ids) {
-  DCHECK_LE(icon_ids.size(), kMaxFaviconsPerPage);
+    favicon_base::FaviconID icon_id) {
   bool mappings_changed = false;
-
-  // Two icon types are considered 'equivalent' if one of the icon types is
-  // TOUCH_ICON and the other is TOUCH_PRECOMPOSED_ICON.
-  //
-  // Sets the icon mappings from |page_url| for |icon_type| to the favicons
-  // with |icon_ids|. Mappings for |page_url| to favicons of type |icon_type|
-  // whose FaviconID is not in |icon_ids| are removed. All icon mappings for
+  // Sets the icon mappings from |page_url| for |icon_type| to the favicon
+  // with |icon_id|. Mappings for |page_url| to favicons of type |icon_type|
+  // with FaviconID other than |icon_id| are removed. All icon mappings for
   // |page_url| to favicons of a type equivalent to |icon_type| are removed.
   // Remove any favicons which are orphaned as a result of the removal of the
   // icon mappings.
 
-  std::vector<favicon_base::FaviconID> unmapped_icon_ids = icon_ids;
+  favicon_base::FaviconID unmapped_icon_id = icon_id;
 
   std::vector<IconMapping> icon_mappings;
   thumbnail_db_->GetIconMappingsForPageURL(page_url, &icon_mappings);
 
-  for (std::vector<IconMapping>::iterator m = icon_mappings.begin();
-       m != icon_mappings.end(); ++m) {
-    std::vector<favicon_base::FaviconID>::iterator icon_id_it = std::find(
-        unmapped_icon_ids.begin(), unmapped_icon_ids.end(), m->icon_id);
-
-    // If the icon mapping already exists, avoid removing it and adding it back.
-    if (icon_id_it != unmapped_icon_ids.end()) {
-      unmapped_icon_ids.erase(icon_id_it);
+  for (auto m = icon_mappings.begin(); m != icon_mappings.end(); ++m) {
+    if (unmapped_icon_id == m->icon_id) {
+      unmapped_icon_id = 0;
       continue;
     }
 
-    if ((icon_type == favicon_base::TOUCH_ICON &&
-         m->icon_type == favicon_base::TOUCH_PRECOMPOSED_ICON) ||
-        (icon_type == favicon_base::TOUCH_PRECOMPOSED_ICON &&
-         m->icon_type == favicon_base::TOUCH_ICON) ||
-        (icon_type == m->icon_type)) {
+    if (AreIconTypesEquivalent(icon_type, m->icon_type)) {
       thumbnail_db_->DeleteIconMapping(m->mapping_id);
 
       // Removing the icon mapping may have orphaned the associated favicon so
@@ -2154,32 +2293,28 @@ bool HistoryBackend::SetFaviconMappingsForPage(
     }
   }
 
-  for (size_t i = 0; i < unmapped_icon_ids.size(); ++i) {
-    thumbnail_db_->AddIconMapping(page_url, unmapped_icon_ids[i]);
+  if (unmapped_icon_id) {
+    thumbnail_db_->AddIconMapping(page_url, unmapped_icon_id);
     mappings_changed = true;
   }
   return mappings_changed;
 }
 
-void HistoryBackend::GetCachedRecentRedirects(const GURL& page_url,
-                                              RedirectList* redirect_list) {
-  RedirectCache::iterator iter = recent_redirects_.Get(page_url);
+RedirectList HistoryBackend::GetCachedRecentRedirects(const GURL& page_url) {
+  auto iter = recent_redirects_.Get(page_url);
   if (iter != recent_redirects_.end()) {
-    *redirect_list = iter->second;
-
     // The redirect chain should have the destination URL as the last item.
-    DCHECK(!redirect_list->empty());
-    DCHECK_EQ(redirect_list->back(), page_url);
-  } else {
-    // No known redirects, construct mock redirect chain containing |page_url|.
-    redirect_list->push_back(page_url);
+    DCHECK(!iter->second.empty());
+    DCHECK_EQ(iter->second.back(), page_url);
+    return iter->second;
   }
+  // No known redirects, construct mock redirect chain containing |page_url|.
+  return RedirectList{page_url};
 }
 
 void HistoryBackend::SendFaviconChangedNotificationForPageAndRedirects(
     const GURL& page_url) {
-  RedirectList redirect_list;
-  GetCachedRecentRedirects(page_url, &redirect_list);
+  RedirectList redirect_list = GetCachedRecentRedirects(page_url);
   if (!redirect_list.empty()) {
     std::set<GURL> favicons_changed(redirect_list.begin(),
                                        redirect_list.end());
@@ -2224,45 +2359,44 @@ void HistoryBackend::Commit() {
 }
 
 void HistoryBackend::ScheduleCommit() {
-  if (scheduled_commit_)
+  // Non-cancelled means there's an already scheduled commit. Note that
+  // CancelableClosure starts cancelled with the default constructor.
+  if (!scheduled_commit_.IsCancelled())
     return;
-  scheduled_commit_ = new CommitLaterTask(this);
+
+  scheduled_commit_.Reset(
+      base::Bind(&HistoryBackend::Commit, base::Unretained(this)));
+
   task_runner_->PostDelayedTask(
-      FROM_HERE,
-      base::Bind(&CommitLaterTask::RunCommit, scheduled_commit_.get()),
+      FROM_HERE, scheduled_commit_.callback(),
       base::TimeDelta::FromSeconds(kCommitIntervalSeconds));
 }
 
 void HistoryBackend::CancelScheduledCommit() {
-  if (scheduled_commit_) {
-    scheduled_commit_->Cancel();
-    scheduled_commit_ = nullptr;
-  }
+  scheduled_commit_.Cancel();
 }
 
 void HistoryBackend::ProcessDBTaskImpl() {
   if (!db_) {
     // db went away, release all the refs.
-    STLDeleteContainerPointers(queued_history_db_tasks_.begin(),
-                               queued_history_db_tasks_.end());
     queued_history_db_tasks_.clear();
     return;
   }
 
   // Remove any canceled tasks.
   while (!queued_history_db_tasks_.empty()) {
-    QueuedHistoryDBTask* task = queued_history_db_tasks_.front();
+    QueuedHistoryDBTask* task = queued_history_db_tasks_.front().get();
     if (!task->is_canceled())
       break;
 
-    delete task;
     queued_history_db_tasks_.pop_front();
   }
   if (queued_history_db_tasks_.empty())
     return;
 
   // Run the first task.
-  std::unique_ptr<QueuedHistoryDBTask> task(queued_history_db_tasks_.front());
+  std::unique_ptr<QueuedHistoryDBTask> task =
+      std::move(queued_history_db_tasks_.front());
   queued_history_db_tasks_.pop_front();
   if (task->Run(this, db_.get())) {
     // The task is done, notify the callback.
@@ -2270,9 +2404,9 @@ void HistoryBackend::ProcessDBTaskImpl() {
   } else {
     // The task wants to run some more. Schedule it at the end of the current
     // tasks, and process it after an invoke later.
-    queued_history_db_tasks_.push_back(task.release());
+    queued_history_db_tasks_.push_back(std::move(task));
     task_runner_->PostTask(
-        FROM_HERE, base::Bind(&HistoryBackend::ProcessDBTaskImpl, this));
+        FROM_HERE, base::BindOnce(&HistoryBackend::ProcessDBTaskImpl, this));
   }
 }
 
@@ -2283,7 +2417,7 @@ void HistoryBackend::ProcessDBTaskImpl() {
 ////////////////////////////////////////////////////////////////////////////////
 
 void HistoryBackend::DeleteURLs(const std::vector<GURL>& urls) {
-  expirer_.DeleteURLs(urls);
+  expirer_.DeleteURLs(urls, base::Time::Max());
 
   db_->GetStartDate(&first_recorded_time_);
   // Force a commit, if the user is deleting something for privacy reasons, we
@@ -2292,8 +2426,19 @@ void HistoryBackend::DeleteURLs(const std::vector<GURL>& urls) {
 }
 
 void HistoryBackend::DeleteURL(const GURL& url) {
-  expirer_.DeleteURL(url);
+  expirer_.DeleteURL(url, base::Time::Max());
 
+  db_->GetStartDate(&first_recorded_time_);
+  // Force a commit, if the user is deleting something for privacy reasons, we
+  // want to get it on disk ASAP.
+  Commit();
+}
+
+void HistoryBackend::DeleteURLsUntil(
+    const std::vector<std::pair<GURL, base::Time>>& urls_and_timestamps) {
+  for (const auto& pair : urls_and_timestamps) {
+    expirer_.DeleteURL(pair.first, pair.second);
+  }
   db_->GetStartDate(&first_recorded_time_);
   // Force a commit, if the user is deleting something for privacy reasons, we
   // want to get it on disk ASAP.
@@ -2302,7 +2447,8 @@ void HistoryBackend::DeleteURL(const GURL& url) {
 
 void HistoryBackend::ExpireHistoryBetween(const std::set<GURL>& restrict_urls,
                                           Time begin_time,
-                                          Time end_time) {
+                                          Time end_time,
+                                          bool user_initiated) {
   if (!db_)
     return;
 
@@ -2313,7 +2459,8 @@ void HistoryBackend::ExpireHistoryBetween(const std::set<GURL>& restrict_urls,
     DeleteAllHistory();
   } else {
     // Clearing parts of history, have the expirer do the depend
-    expirer_.ExpireHistoryBetween(restrict_urls, begin_time, end_time);
+    expirer_.ExpireHistoryBetween(restrict_urls, begin_time, end_time,
+                                  user_initiated);
 
     // Force a commit, if the user is deleting something for privacy reasons,
     // we want to get it on disk ASAP.
@@ -2377,10 +2524,9 @@ void HistoryBackend::ExpireHistory(
   if (db_) {
     bool update_first_recorded_time = false;
 
-    for (std::vector<ExpireHistoryArgs>::const_iterator it =
-             expire_list.begin();
-         it != expire_list.end(); ++it) {
-      expirer_.ExpireHistoryBetween(it->urls, it->begin_time, it->end_time);
+    for (auto it = expire_list.begin(); it != expire_list.end(); ++it) {
+      expirer_.ExpireHistoryBetween(it->urls, it->begin_time, it->end_time,
+                                    true);
 
       if (it->begin_time < first_recorded_time_)
         update_first_recorded_time = true;
@@ -2393,11 +2539,18 @@ void HistoryBackend::ExpireHistory(
   }
 }
 
+void HistoryBackend::ExpireHistoryBeforeForTesting(base::Time end_time) {
+  if (!db_)
+    return;
+
+  expirer_.ExpireHistoryBeforeForTesting(end_time);
+}
+
 void HistoryBackend::URLsNoLongerBookmarked(const std::set<GURL>& urls) {
   if (!db_)
     return;
 
-  for (std::set<GURL>::const_iterator i = urls.begin(); i != urls.end(); ++i) {
+  for (auto i = urls.begin(); i != urls.end(); ++i) {
     VisitVector visits;
     URLRow url_row;
     if (db_->GetRowForURL(*i, &url_row))
@@ -2406,19 +2559,25 @@ void HistoryBackend::URLsNoLongerBookmarked(const std::set<GURL>& urls) {
     // that we can delete all associated icons in the case of deleting an
     // unvisited bookmarked URL.
     if (visits.empty())
-      expirer_.DeleteURL(*i);  // There are no more visits; nuke the URL.
+      expirer_.DeleteURL(*i, base::Time::Max());
   }
 }
 
 void HistoryBackend::DatabaseErrorCallback(int error, sql::Statement* stmt) {
   if (!scheduled_kill_db_ && sql::IsErrorCatastrophic(error)) {
     scheduled_kill_db_ = true;
+
+    db_diagnostics_ = db_->GetDiagnosticInfo(error, stmt);
+
     // Don't just do the close/delete here, as we are being called by |db| and
     // that seems dangerous.
-    // TODO(shess): Consider changing KillHistoryDatabase() to use
-    // RazeAndClose().  Then it can be cleared immediately.
+    // TODO(https://crbug.com/854258): It is also dangerous to kill the database
+    // by a posted task: tasks that run before KillHistoryDatabase still can try
+    // to use the broken database. Consider protecting against other tasks using
+    // the DB or consider changing KillHistoryDatabase() to use RazeAndClose()
+    // (then it can be cleared immediately).
     task_runner_->PostTask(
-        FROM_HERE, base::Bind(&HistoryBackend::KillHistoryDatabase, this));
+        FROM_HERE, base::BindOnce(&HistoryBackend::KillHistoryDatabase, this));
   }
 }
 
@@ -2426,6 +2585,11 @@ void HistoryBackend::KillHistoryDatabase() {
   scheduled_kill_db_ = false;
   if (!db_)
     return;
+
+  // Notify SyncBridge about storage error. It will report failure to sync
+  // engine and stop accepting remote updates.
+  if (typed_url_sync_bridge_)
+    typed_url_sync_bridge_->OnDatabaseError();
 
   // Rollback transaction because Raze() cannot be called from within a
   // transaction.
@@ -2451,10 +2615,11 @@ base::SupportsUserData::Data* HistoryBackend::GetUserData(
   return supports_user_data_helper_->GetUserData(key);
 }
 
-void HistoryBackend::SetUserData(const void* key,
-                                 base::SupportsUserData::Data* data) {
+void HistoryBackend::SetUserData(
+    const void* key,
+    std::unique_ptr<base::SupportsUserData::Data> data) {
   DCHECK(supports_user_data_helper_);
-  supports_user_data_helper_->SetUserData(key, data);
+  supports_user_data_helper_->SetUserData(key, std::move(data));
 }
 
 void HistoryBackend::ProcessDBTask(
@@ -2462,88 +2627,88 @@ void HistoryBackend::ProcessDBTask(
     scoped_refptr<base::SingleThreadTaskRunner> origin_loop,
     const base::CancelableTaskTracker::IsCanceledCallback& is_canceled) {
   bool scheduled = !queued_history_db_tasks_.empty();
-  queued_history_db_tasks_.push_back(
-      new QueuedHistoryDBTask(std::move(task), origin_loop, is_canceled));
+  queued_history_db_tasks_.push_back(std::make_unique<QueuedHistoryDBTask>(
+      std::move(task), origin_loop, is_canceled));
   if (!scheduled)
     ProcessDBTaskImpl();
 }
 
 void HistoryBackend::NotifyFaviconsChanged(const std::set<GURL>& page_urls,
                                            const GURL& icon_url) {
-  if (delegate_)
-    delegate_->NotifyFaviconsChanged(page_urls, icon_url);
+  delegate_->NotifyFaviconsChanged(page_urls, icon_url);
 }
 
 void HistoryBackend::NotifyURLVisited(ui::PageTransition transition,
                                       const URLRow& row,
                                       const RedirectList& redirects,
                                       base::Time visit_time) {
-  FOR_EACH_OBSERVER(HistoryBackendObserver, observers_,
-                    OnURLVisited(this, transition, row, redirects, visit_time));
+  for (HistoryBackendObserver& observer : observers_)
+    observer.OnURLVisited(this, transition, row, redirects, visit_time);
 
-  if (delegate_)
-    delegate_->NotifyURLVisited(transition, row, redirects, visit_time);
+  delegate_->NotifyURLVisited(transition, row, redirects, visit_time);
 }
 
-void HistoryBackend::NotifyURLsModified(const URLRows& rows) {
-  FOR_EACH_OBSERVER(HistoryBackendObserver, observers_,
-                    OnURLsModified(this, rows));
+void HistoryBackend::NotifyURLsModified(const URLRows& changed_urls,
+                                        bool is_from_expiration) {
+  for (HistoryBackendObserver& observer : observers_)
+    observer.OnURLsModified(this, changed_urls, is_from_expiration);
 
-  if (delegate_)
-    delegate_->NotifyURLsModified(rows);
+  delegate_->NotifyURLsModified(changed_urls);
 }
 
-void HistoryBackend::NotifyURLsDeleted(bool all_history,
-                                       bool expired,
-                                       const URLRows& rows,
-                                       const std::set<GURL>& favicon_urls) {
-  URLRows copied_rows(rows);
-  FOR_EACH_OBSERVER(
-      HistoryBackendObserver, observers_,
-      OnURLsDeleted(this, all_history, expired, copied_rows, favicon_urls));
+void HistoryBackend::NotifyURLsDeleted(DeletionInfo deletion_info) {
+  std::set<GURL> origins;
+  for (const history::URLRow& row : deletion_info.deleted_rows())
+    origins.insert(row.url().GetOrigin());
 
-  if (delegate_)
-    delegate_->NotifyURLsDeleted(all_history, expired, copied_rows,
-                                 favicon_urls);
+  deletion_info.set_deleted_urls_origin_map(
+      GetCountsAndLastVisitForOrigins(origins));
+
+  for (HistoryBackendObserver& observer : observers_) {
+    observer.OnURLsDeleted(
+        this, deletion_info.IsAllHistory(), deletion_info.is_from_expiration(),
+        deletion_info.deleted_rows(), deletion_info.favicon_urls());
+  }
+
+  delegate_->NotifyURLsDeleted(std::move(deletion_info));
 }
 
 // Deleting --------------------------------------------------------------------
 
 void HistoryBackend::DeleteAllHistory() {
   // Our approach to deleting all history is:
-  //  1. Copy the bookmarks and their dependencies to new tables with temporary
-  //     names.
+  //  1. Copy the pinned URLs and their dependencies to new tables with
+  //     temporary names.
   //  2. Delete the original tables. Since tables can not share pages, we know
   //     that any data we don't want to keep is now in an unused page.
   //  3. Renaming the temporary tables to match the original.
   //  4. Vacuuming the database to delete the unused pages.
   //
-  // Since we are likely to have very few bookmarks and their dependencies
+  // Since we are likely to have very few pinned URLs and their dependencies
   // compared to all history, this is also much faster than just deleting from
   // the original tables directly.
 
-  // Get the bookmarked URLs.
-  std::vector<URLAndTitle> starred_url_and_titles;
+  // Get the pinned URLs.
+  std::vector<URLAndTitle> pinned_url;
   if (backend_client_)
-    backend_client_->GetBookmarks(&starred_url_and_titles);
+    pinned_url = backend_client_->GetPinnedURLs();
 
   URLRows kept_url_rows;
   std::vector<GURL> starred_urls;
-  for (const URLAndTitle& url_and_title : starred_url_and_titles) {
-    const GURL& url = url_and_title.url;
-    starred_urls.push_back(url);
-
+  for (URLAndTitle& url_and_title : pinned_url) {
     URLRow row;
-    if (db_->GetRowForURL(url, &row)) {
+    if (db_->GetRowForURL(url_and_title.url, &row)) {
       // Clear the last visit time so when we write these rows they are "clean."
       row.set_last_visit(Time());
       row.set_visit_count(0);
       row.set_typed_count(0);
       kept_url_rows.push_back(row);
     }
+
+    starred_urls.push_back(std::move(url_and_title.url));
   }
 
-  // Delete all cached favicons which are not used by bookmarks.
+  // Delete all cached favicons which are not used by the UI.
   if (!ClearAllThumbnailHistory(starred_urls)) {
     LOG(ERROR) << "Thumbnail history could not be cleared";
     // We continue in this error case. If the user wants to delete their
@@ -2561,7 +2726,7 @@ void HistoryBackend::DeleteAllHistory() {
 
   // Send out the notification that history is cleared. The in-memory database
   // will pick this up and clear itself.
-  NotifyURLsDeleted(true, false, URLRows(), std::set<GURL>());
+  NotifyURLsDeleted(DeletionInfo::ForAllHistory());
 }
 
 bool HistoryBackend::ClearAllThumbnailHistory(
@@ -2571,10 +2736,7 @@ bool HistoryBackend::ClearAllThumbnailHistory(
     // error opening it. In this case, we just try to blow it away to try to
     // fix the error if it exists. This may fail, in which case either the
     // file doesn't exist or there's no more we can do.
-    sql::Connection::Delete(GetFaviconsFileName());
-
-    // Older version of the database.
-    sql::Connection::Delete(GetThumbnailFileName());
+    sql::Database::Delete(GetFaviconsFileName());
     return true;
   }
 
@@ -2591,7 +2753,7 @@ bool HistoryBackend::ClearAllThumbnailHistory(
   }
 
 #if defined(OS_ANDROID)
-  // TODO (michaelbai): Add the unit test once AndroidProviderBackend is
+  // TODO(michaelbai): Add the unit test once AndroidProviderBackend is
   // available in HistoryBackend.
   db_->ClearAndroidURLRows();
 #endif
@@ -2612,8 +2774,7 @@ bool HistoryBackend::ClearAllMainHistory(const URLRows& kept_urls) {
     return false;
 
   // Insert the URLs into the temporary table.
-  for (URLRows::const_iterator i = kept_urls.begin(); i != kept_urls.end();
-       ++i) {
+  for (auto i = kept_urls.begin(); i != kept_urls.end(); ++i) {
     db_->AddTemporaryURL(*i);
   }
 

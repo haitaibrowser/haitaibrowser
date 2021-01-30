@@ -13,15 +13,16 @@
 #include <vector>
 
 #include "base/command_line.h"
-#include "base/containers/hash_tables.h"
 #include "base/files/file_util.h"
-#include "base/metrics/histogram.h"
+#include "base/metrics/histogram_functions.h"
+#include "base/metrics/histogram_macros.h"
 #include "base/numerics/safe_conversions.h"
 #include "base/rand_util.h"
 #include "base/strings/string_util.h"
 #include "base/time/time.h"
 #include "build/build_config.h"
 #include "components/history/core/browser/url_utils.h"
+#include "sql/meta_table.h"
 #include "sql/statement.h"
 #include "sql/transaction.h"
 
@@ -36,10 +37,39 @@ namespace {
 // Current version number. We write databases at the "current" version number,
 // but any previous version that can read the "compatible" one can make do with
 // our database without *too* many bad effects.
-const int kCurrentVersionNumber = 32;
+const int kCurrentVersionNumber = 41;
 const int kCompatibleVersionNumber = 16;
 const char kEarlyExpirationThresholdKey[] = "early_expiration_threshold";
-const int kMaxHostsInMemory = 10000;
+
+// Logs a migration failure to UMA and logging. The return value will be
+// what to return from ::Init (to simplify the call sites). Migration failures
+// are almost always fatal since the database can be in an inconsistent state.
+sql::InitStatus LogMigrationFailure(int from_version) {
+  base::UmaHistogramSparse("History.MigrateFailureFromVersion", from_version);
+  LOG(ERROR) << "History failed to migrate from version " << from_version
+             << ". History will be disabled.";
+  return sql::INIT_FAILURE;
+}
+
+// Reasons for initialization to fail. These are logged to UMA. It corresponds
+// to the HistoryInitStep enum in enums.xml.
+//
+// DO NOT CHANGE THE VALUES. Leave holes if anything is removed and add only
+// to the end.
+enum class InitStep {
+  OPEN = 0,
+  TRANSACTION_BEGIN = 1,
+  META_TABLE_INIT = 2,
+  CREATE_TABLES = 3,
+  VERSION = 4,
+  COMMIT = 5,
+};
+
+sql::InitStatus LogInitFailure(InitStep what) {
+  base::UmaHistogramSparse("History.InitializationFailureStep",
+                           static_cast<int>(what));
+  return sql::INIT_FAILURE;
+}
 
 }  // namespace
 
@@ -53,11 +83,18 @@ HistoryDatabase::HistoryDatabase(
 HistoryDatabase::~HistoryDatabase() {
 }
 
+// add by jie.zhang 20210130 for enc historyDB
+bool HistoryDatabase::DBKeyEnc() {
+  base::FilePath filename;
+  if (db_.DBKey(filename))
+  {
+  }
+  return true;
+}
+// end add by jie.zhang 20210130 for enc historyDB
+
 sql::InitStatus HistoryDatabase::Init(const base::FilePath& history_name) {
   db_.set_histogram_tag("History");
-
-  // Set the exceptional sqlite error handler.
-  db_.set_error_callback(error_callback_);
 
   // Set the database page size to something a little larger to give us
   // better performance (we're typically seek rather than bandwidth limited).
@@ -75,14 +112,20 @@ sql::InitStatus HistoryDatabase::Init(const base::FilePath& history_name) {
   // BeginExclusiveMode below which is called later (we have to be in shared
   // mode to start out for the in-memory backend to read the data).
 
+  // add by jie.zhang 20210130 for dec historyDB
+  if (db_.DBKey(history_name, true))
+  {
+  }
+  // end add by jie.zhang 20210130 for dec historyDB
+
   if (!db_.Open(history_name))
-    return sql::INIT_FAILURE;
+    return LogInitFailure(InitStep::OPEN);
 
   // Wrap the rest of init in a tranaction. This will prevent the database from
   // getting corrupted if we crash in the middle of initialization or migration.
   sql::Transaction committer(&db_);
   if (!committer.Begin())
-    return sql::INIT_FAILURE;
+    return LogInitFailure(InitStep::TRANSACTION_BEGIN);
 
 #if defined(OS_MACOSX) && !defined(OS_IOS)
   // Exclude the history file from backups.
@@ -96,11 +139,11 @@ sql::InitStatus HistoryDatabase::Init(const base::FilePath& history_name) {
   // NOTE: If you add something here, also add it to
   //       RecreateAllButStarAndURLTables.
   if (!meta_table_.Init(&db_, GetCurrentVersion(), kCompatibleVersionNumber))
-    return sql::INIT_FAILURE;
+    return LogInitFailure(InitStep::META_TABLE_INIT);
   if (!CreateURLTable(false) || !InitVisitTable() ||
       !InitKeywordSearchTermsTable() || !InitDownloadTable() ||
-      !InitSegmentTables())
-    return sql::INIT_FAILURE;
+      !InitSegmentTables() || !InitSyncTable())
+    return LogInitFailure(InitStep::CREATE_TABLES);
   CreateMainURLIndex();
   CreateKeywordSearchTermsIndices();
 
@@ -109,10 +152,14 @@ sql::InitStatus HistoryDatabase::Init(const base::FilePath& history_name) {
 
   // Version check.
   sql::InitStatus version_status = EnsureCurrentVersion();
-  if (version_status != sql::INIT_OK)
+  if (version_status != sql::INIT_OK) {
+    LogInitFailure(InitStep::VERSION);
     return version_status;
+  }
 
-  return committer.Commit() ? sql::INIT_OK : sql::INIT_FAILURE;
+  if (!committer.Commit())
+    return LogInitFailure(InitStep::COMMIT);
+  return sql::INIT_OK;
 }
 
 void HistoryDatabase::ComputeDatabaseMetrics(
@@ -127,13 +174,13 @@ void HistoryDatabase::ComputeDatabaseMetrics(
   sql::Statement url_count(db_.GetUniqueStatement("SELECT count(*) FROM urls"));
   if (!url_count.Step())
     return;
-  UMA_HISTOGRAM_COUNTS("History.URLTableCount", url_count.ColumnInt(0));
+  UMA_HISTOGRAM_COUNTS_1M("History.URLTableCount", url_count.ColumnInt(0));
 
   sql::Statement visit_count(db_.GetUniqueStatement(
       "SELECT count(*) FROM visits"));
   if (!visit_count.Step())
     return;
-  UMA_HISTOGRAM_COUNTS("History.VisitTableCount", visit_count.ColumnInt(0));
+  UMA_HISTOGRAM_COUNTS_1M("History.VisitTableCount", visit_count.ColumnInt(0));
 
   base::Time one_week_ago = base::Time::Now() - base::TimeDelta::FromDays(7);
   sql::Statement weekly_visit_sql(db_.GetUniqueStatement(
@@ -142,7 +189,7 @@ void HistoryDatabase::ComputeDatabaseMetrics(
   int weekly_visit_count = 0;
   if (weekly_visit_sql.Step())
     weekly_visit_count = weekly_visit_sql.ColumnInt(0);
-  UMA_HISTOGRAM_COUNTS("History.WeeklyVisitCount", weekly_visit_count);
+  UMA_HISTOGRAM_COUNTS_1M("History.WeeklyVisitCount", weekly_visit_count);
 
   base::Time one_month_ago = base::Time::Now() - base::TimeDelta::FromDays(30);
   sql::Statement monthly_visit_sql(db_.GetUniqueStatement(
@@ -152,8 +199,8 @@ void HistoryDatabase::ComputeDatabaseMetrics(
   int older_visit_count = 0;
   if (monthly_visit_sql.Step())
     older_visit_count = monthly_visit_sql.ColumnInt(0);
-  UMA_HISTOGRAM_COUNTS("History.MonthlyVisitCount",
-                       older_visit_count + weekly_visit_count);
+  UMA_HISTOGRAM_COUNTS_1M("History.MonthlyVisitCount",
+                          older_visit_count + weekly_visit_count);
 
   UMA_HISTOGRAM_TIMES("History.DatabaseBasicMetricsTime",
                       base::TimeTicks::Now() - start_time);
@@ -185,10 +232,10 @@ void HistoryDatabase::ComputeDatabaseMetrics(
         week_hosts.insert(url.host());
       }
     }
-    UMA_HISTOGRAM_COUNTS("History.WeeklyURLCount", week_url_count);
+    UMA_HISTOGRAM_COUNTS_1M("History.WeeklyURLCount", week_url_count);
     UMA_HISTOGRAM_COUNTS_10000("History.WeeklyHostCount",
                                static_cast<int>(week_hosts.size()));
-    UMA_HISTOGRAM_COUNTS("History.MonthlyURLCount", month_url_count);
+    UMA_HISTOGRAM_COUNTS_1M("History.MonthlyURLCount", month_url_count);
     UMA_HISTOGRAM_COUNTS_10000("History.MonthlyHostCount",
                                static_cast<int>(month_hosts.size()));
     UMA_HISTOGRAM_TIMES("History.DatabaseAdvancedMetricsTime",
@@ -196,47 +243,27 @@ void HistoryDatabase::ComputeDatabaseMetrics(
   }
 }
 
-TopHostsList HistoryDatabase::TopHosts(size_t num_hosts) {
-  base::Time one_month_ago =
-      std::max(base::Time::Now() - base::TimeDelta::FromDays(30), base::Time());
+int HistoryDatabase::CountUniqueHostsVisitedLastMonth() {
+  base::TimeTicks start_time = base::TimeTicks::Now();
+  // Collect all URLs visited within the last month.
+  base::Time one_month_ago = base::Time::Now() - base::TimeDelta::FromDays(30);
 
-  sql::Statement url_sql(db_.GetUniqueStatement(
-      "SELECT url, visit_count FROM urls WHERE last_visit_time > ?"));
+  sql::Statement url_sql(
+      db_.GetUniqueStatement("SELECT url FROM urls "
+                             "WHERE last_visit_time > ? "
+                             "AND hidden = 0 "
+                             "AND visit_count > 0"));
   url_sql.BindInt64(0, one_month_ago.ToInternalValue());
 
-  // Collect a map from host to visit count.
-  base::hash_map<std::string, int> host_count;
+  std::set<std::string> hosts;
   while (url_sql.Step()) {
     GURL url(url_sql.ColumnString(0));
-    if (!(url.is_valid() && (url.SchemeIsHTTPOrHTTPS() || url.SchemeIs("ftp"))))
-      continue;
-
-    int64_t visit_count = url_sql.ColumnInt64(1);
-    host_count[HostForTopHosts(url)] += visit_count;
-
-    // kMaxHostsInMemory is well above typical values for
-    // History.MonthlyHostCount, but here to guard against unbounded memory
-    // growth in the event of an atypical history.
-    if (host_count.size() >= kMaxHostsInMemory)
-      break;
+    hosts.insert(url.host());
   }
 
-  // Collect the top 100 hosts by visit count, into the range
-  // [top_hosts.begin(), middle).
-  typedef std::vector<std::pair<int, std::string>> IntermediateList;
-  IntermediateList top_hosts;
-  for (const auto& it : host_count)
-    top_hosts.push_back(std::make_pair(-it.second, it.first));
-  IntermediateList::size_type middle_index =
-      std::min(num_hosts, top_hosts.size());
-  auto middle = std::min(top_hosts.end(), top_hosts.begin() + middle_index);
-  std::partial_sort(top_hosts.begin(), middle, top_hosts.end());
-
-  TopHostsList hosts;
-  for (IntermediateList::const_iterator it = top_hosts.begin(); it != middle;
-       ++it)
-    hosts.push_back(std::make_pair(it->second, -it->first));
-  return hosts;
+  UMA_HISTOGRAM_TIMES("History.DatabaseMonthlyHostCountTime",
+                      base::TimeTicks::Now() - start_time);
+  return hosts.size();
 }
 
 void HistoryDatabase::BeginExclusiveMode() {
@@ -259,7 +286,13 @@ void HistoryDatabase::CommitTransaction() {
 }
 
 void HistoryDatabase::RollbackTransaction() {
-  db_.RollbackTransaction();
+  // If Init() returns with a failure status, the Transaction created there will
+  // be destructed and rolled back. HistoryBackend might try to kill the
+  // database after that, at which point it will try to roll back a non-existing
+  // transaction. This will crash on a DCHECK. So transaction_nesting() is
+  // checked first.
+  if (db_.transaction_nesting())
+    db_.RollbackTransaction();
 }
 
 bool HistoryDatabase::RecreateAllTablesButURL() {
@@ -288,12 +321,17 @@ void HistoryDatabase::Vacuum() {
   ignore_result(db_.Execute("VACUUM"));
 }
 
-void HistoryDatabase::TrimMemory(bool aggressively) {
-  db_.TrimMemory(aggressively);
+void HistoryDatabase::TrimMemory() {
+  db_.TrimMemory();
 }
 
 bool HistoryDatabase::Raze() {
   return db_.Raze();
+}
+
+std::string HistoryDatabase::GetDiagnosticInfo(int extended_error,
+                                               sql::Statement* statement) {
+  return db_.GetDiagnosticInfo(extended_error, statement);
 }
 
 bool HistoryDatabase::SetSegmentID(VisitID visit_id, SegmentID segment_id) {
@@ -311,13 +349,9 @@ SegmentID HistoryDatabase::GetSegmentID(VisitID visit_id) {
       "SELECT segment_id FROM visits WHERE id = ?"));
   s.BindInt64(0, visit_id);
 
-  if (s.Step()) {
-    if (s.ColumnType(0) == sql::COLUMN_TYPE_NULL)
-      return 0;
-    else
-      return s.ColumnInt64(0);
-  }
-  return 0;
+  if (!s.Step() || s.GetColumnType(0) == sql::ColumnType::kNull)
+    return 0;
+  return s.ColumnInt64(0);
 }
 
 base::Time HistoryDatabase::GetEarlyExpirationThreshold() {
@@ -341,8 +375,12 @@ void HistoryDatabase::UpdateEarlyExpirationThreshold(base::Time threshold) {
   cached_early_expiration_threshold_ = threshold;
 }
 
-sql::Connection& HistoryDatabase::GetDB() {
+sql::Database& HistoryDatabase::GetDB() {
   return db_;
+}
+
+sql::MetaTable& HistoryDatabase::GetMetaTable() {
+  return meta_table_;
 }
 
 // Migration -------------------------------------------------------------------
@@ -359,10 +397,8 @@ sql::InitStatus HistoryDatabase::EnsureCurrentVersion() {
   // Put migration code here
 
   if (cur_version == 15) {
-    if (!db_.Execute("DROP TABLE starred") || !DropStarredIDFromURLs()) {
-      LOG(WARNING) << "Unable to update history database to version 16.";
-      return sql::INIT_FAILURE;
-    }
+    if (!db_.Execute("DROP TABLE starred") || !DropStarredIDFromURLs())
+      return LogMigrationFailure(15);
     ++cur_version;
     meta_table_.SetVersionNumber(cur_version);
     meta_table_.SetCompatibleVersionNumber(
@@ -406,10 +442,8 @@ sql::InitStatus HistoryDatabase::EnsureCurrentVersion() {
   if (cur_version == 20) {
     // This is the version prior to adding the visit_duration field in visits
     // database. We need to migrate the database.
-    if (!MigrateVisitsWithoutDuration()) {
-      LOG(WARNING) << "Unable to update history database to version 21.";
-      return sql::INIT_FAILURE;
-    }
+    if (!MigrateVisitsWithoutDuration())
+      return LogMigrationFailure(20);
     ++cur_version;
     meta_table_.SetVersionNumber(cur_version);
   }
@@ -417,105 +451,172 @@ sql::InitStatus HistoryDatabase::EnsureCurrentVersion() {
   if (cur_version == 21) {
     // The android_urls table's data schemal was changed in version 21.
 #if defined(OS_ANDROID)
-    if (!MigrateToVersion22()) {
-      LOG(WARNING) << "Unable to migrate the android_urls table to version 22";
-    }
+    if (!MigrateToVersion22())
+      return LogMigrationFailure(21);
 #endif
     ++cur_version;
     meta_table_.SetVersionNumber(cur_version);
   }
 
   if (cur_version == 22) {
-    if (!MigrateDownloadsState()) {
-      LOG(WARNING) << "Unable to fix invalid downloads state values";
-      // Invalid state values may cause crashes.
-      return sql::INIT_FAILURE;
-    }
+    if (!MigrateDownloadsState())
+      return LogMigrationFailure(22);
     cur_version++;
     meta_table_.SetVersionNumber(cur_version);
   }
 
   if (cur_version == 23) {
-    if (!MigrateDownloadsReasonPathsAndDangerType()) {
-      LOG(WARNING) << "Unable to upgrade download interrupt reason and paths";
-      // Invalid state values may cause crashes.
-      return sql::INIT_FAILURE;
-    }
+    if (!MigrateDownloadsReasonPathsAndDangerType())
+      return LogMigrationFailure(23);
     cur_version++;
     meta_table_.SetVersionNumber(cur_version);
   }
 
   if (cur_version == 24) {
-    if (!MigratePresentationIndex()) {
-      LOG(WARNING) << "Unable to migrate history to version 25";
-      return sql::INIT_FAILURE;
-    }
+    if (!MigratePresentationIndex())
+      return LogMigrationFailure(24);
     cur_version++;
     meta_table_.SetVersionNumber(cur_version);
   }
 
   if (cur_version == 25) {
-    if (!MigrateReferrer()) {
-      LOG(WARNING) << "Unable to migrate history to version 26";
-      return sql::INIT_FAILURE;
-    }
+    if (!MigrateReferrer())
+      return LogMigrationFailure(25);
     cur_version++;
     meta_table_.SetVersionNumber(cur_version);
   }
 
   if (cur_version == 26) {
-    if (!MigrateDownloadedByExtension()) {
-      LOG(WARNING) << "Unable to migrate history to version 27";
-      return sql::INIT_FAILURE;
-    }
+    if (!MigrateDownloadedByExtension())
+      return LogMigrationFailure(26);
     cur_version++;
     meta_table_.SetVersionNumber(cur_version);
   }
 
   if (cur_version == 27) {
-    if (!MigrateDownloadValidators()) {
-      LOG(WARNING) << "Unable to migrate history to version 28";
-      return sql::INIT_FAILURE;
-    }
+    if (!MigrateDownloadValidators())
+      return LogMigrationFailure(27);
     cur_version++;
     meta_table_.SetVersionNumber(cur_version);
   }
 
   if (cur_version == 28) {
-    if (!MigrateMimeType()) {
-      LOG(WARNING) << "Unable to migrate history to version 29";
-      return sql::INIT_FAILURE;
-    }
+    if (!MigrateMimeType())
+      return LogMigrationFailure(28);
     cur_version++;
     meta_table_.SetVersionNumber(cur_version);
   }
 
   if (cur_version == 29) {
-    if (!MigrateHashHttpMethodAndGenerateGuids()) {
-      LOG(WARNING) << "Unable to migrate history to version 30";
-      return sql::INIT_FAILURE;
-    }
+    if (!MigrateHashHttpMethodAndGenerateGuids())
+      return LogMigrationFailure(29);
     cur_version++;
     meta_table_.SetVersionNumber(cur_version);
   }
 
   if (cur_version == 30) {
-    if (!MigrateDownloadTabUrl()) {
-      LOG(WARNING) << "Unable to migrate history to version 31";
-      return sql::INIT_FAILURE;
-    }
+    if (!MigrateDownloadTabUrl())
+      return LogMigrationFailure(30);
     cur_version++;
     meta_table_.SetVersionNumber(cur_version);
   }
 
   if (cur_version == 31) {
-    if (!MigrateDownloadSiteInstanceUrl()) {
-      LOG(WARNING) << "Unable to migrate history to version 32";
-      return sql::INIT_FAILURE;
+    if (!MigrateDownloadSiteInstanceUrl())
+      return LogMigrationFailure(31);
+    cur_version++;
+    meta_table_.SetVersionNumber(cur_version);
+  }
+
+  if (cur_version == 32) {
+    // New download slices table is introduced, no migration needed.
+    cur_version++;
+    meta_table_.SetVersionNumber(cur_version);
+  }
+
+  if (cur_version == 33) {
+    if (!MigrateDownloadLastAccessTime())
+      return LogMigrationFailure(33);
+    cur_version++;
+    meta_table_.SetVersionNumber(cur_version);
+  }
+
+  if (cur_version == 34) {
+    // This originally contained an autoincrement migration which was abandoned
+    // and added back in version 36. (see https://crbug.com/736136)
+    cur_version++;
+    meta_table_.SetVersionNumber(cur_version);
+  }
+
+  if (cur_version == 35) {
+    if (!MigrateDownloadTransient())
+      return LogMigrationFailure(35);
+    cur_version++;
+    meta_table_.SetVersionNumber(cur_version);
+  }
+
+  if (cur_version == 36) {
+    // Version 34 added AUTOINCREMENT but was reverted. Since some users will
+    // have been migrated and others not, explicitly check for the AUTOINCREMENT
+    // annotation rather than the version number.
+    if (!URLTableContainsAutoincrement()) {
+      if (!RecreateURLTableWithAllContents())
+        return LogMigrationFailure(36);
+    }
+
+    DCHECK(URLTableContainsAutoincrement());
+    cur_version++;
+    meta_table_.SetVersionNumber(cur_version);
+  }
+
+  if (cur_version == 37) {
+    if (!MigrateVisitSegmentNames())
+      return LogMigrationFailure(37);
+    cur_version++;
+    meta_table_.SetVersionNumber(cur_version);
+  }
+
+  if (cur_version == 38) {
+    if (!MigrateDownloadSliceFinished())
+      return LogMigrationFailure(38);
+    cur_version++;
+    meta_table_.SetVersionNumber(cur_version);
+  }
+
+  if (cur_version == 39) {
+    if (!MigrateVisitsWithoutIncrementedOmniboxTypedScore())
+      return LogMigrationFailure(39);
+    cur_version++;
+    meta_table_.SetVersionNumber(cur_version);
+  }
+
+  if (cur_version == 40) {
+    std::vector<URLID> visited_url_rowids_sorted;
+    if (!GetAllVisitedURLRowidsForMigrationToVersion40(
+            &visited_url_rowids_sorted) ||
+        !CleanTypedURLOrphanedMetadataForMigrationToVersion40(
+            visited_url_rowids_sorted)) {
+      return LogMigrationFailure(40);
     }
     cur_version++;
     meta_table_.SetVersionNumber(cur_version);
   }
+
+  // =========================       ^^ new migration code goes here ^^
+  // ADDING NEW MIGRATION CODE
+  // =========================
+  //
+  // Add new migration code above here. It's important to use as little space
+  // as possible during migration. Many phones are very near their storage
+  // limit, so anything that recreates or duplicates large history tables can
+  // easily push them over that limit.
+  //
+  // When failures happen during initialization, history is not loaded. This
+  // causes all components related to the history database file to fail
+  // completely, including autocomplete and downloads. Devices near their
+  // storage limit are likely to fail doing some update later, but those
+  // operations will then just be skipped which is not nearly as disruptive.
+  // See https://crbug.com/734194.
 
   // When the version is too old, we just try to continue anyway, there should
   // not be a released product that makes a database too old for us to handle.
